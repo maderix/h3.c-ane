@@ -15,6 +15,7 @@
 #include "h3_text_encoder.h"
 
 #include <math.h>
+#include <mach/mach.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,9 +267,72 @@ typedef struct {
     double load_seconds;
     double forward_seconds;
     uint32_t rows;
+    uint64_t resident_bytes;
+    uint64_t footprint_bytes;
+    uint64_t compressed_bytes;
 } run;
 
 static unsigned active_blocks = BLOCKS;
+
+typedef struct {
+    uint64_t pageins;
+    uint64_t pageouts;
+    uint64_t swapins;
+    uint64_t swapouts;
+    uint64_t compressions;
+    uint64_t decompressions;
+    uint64_t page_size;
+} vm_counters;
+
+static int system_vm(vm_counters *out) {
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    mach_port_t host = mach_host_self();
+    kern_return_t status = host_statistics64(
+        host, HOST_VM_INFO64, (host_info64_t)&vm, &count);
+    vm_size_t page_size = 0;
+    kern_return_t page_status = host_page_size(host, &page_size);
+    mach_port_deallocate(mach_task_self(), host);
+    if (status != KERN_SUCCESS || page_status != KERN_SUCCESS) return 0;
+    out->pageins = vm.pageins;
+    out->pageouts = vm.pageouts;
+    out->swapins = vm.swapins;
+    out->swapouts = vm.swapouts;
+    out->compressions = vm.compressions;
+    out->decompressions = vm.decompressions;
+    out->page_size = page_size;
+    return 1;
+}
+
+static void print_vm_delta(const char *label, const vm_counters *before,
+                           const vm_counters *after) {
+    double scale = (double)after->page_size / (1024.0 * 1024.0);
+    printf("  %-5s pagein=%.1f MiB pageout=%.1f MiB swapin=%.1f MiB "
+           "swapout=%.1f MiB compress=%.1f MiB decompress=%.1f MiB\n",
+           label, (double)(after->pageins - before->pageins) * scale,
+           (double)(after->pageouts - before->pageouts) * scale,
+           (double)(after->swapins - before->swapins) * scale,
+           (double)(after->swapouts - before->swapouts) * scale,
+           (double)(after->compressions - before->compressions) * scale,
+           (double)(after->decompressions - before->decompressions) * scale);
+}
+
+static int process_memory(run *out) {
+    mach_task_basic_info_data_t basic;
+    mach_msg_type_number_t basic_count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&basic, &basic_count) != KERN_SUCCESS)
+        return 0;
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&vm, &vm_count) != KERN_SUCCESS)
+        return 0;
+    out->resident_bytes = basic.resident_size;
+    out->footprint_bytes = vm.phys_footprint;
+    out->compressed_bytes = vm.compressed;
+    return 1;
+}
 
 static int forward_once(const char *directory, const h3_text_embedding *text,
                         const h3_layout *layout,
@@ -284,6 +348,8 @@ static int forward_once(const char *directory, const h3_text_embedding *text,
         return 0;
     }
     out->load_seconds = seconds() - started;
+    if (!process_memory(out))
+        fprintf(stderr, "warning: cannot sample process memory\n");
     out->video_elements = h3_dit_video_elements(dit);
     out->audio_elements = h3_dit_audio_elements(dit);
     float *video = calloc(out->video_elements, sizeof(float));
@@ -374,12 +440,18 @@ int main(int argc, char **argv) {
            layout.seq_len);
 
     run metal = {0}, ane = {0};
+    vm_counters vm_start = {0}, vm_after_metal = {0}, vm_after_ane = {0};
+    int vm_ok = system_vm(&vm_start);
+    if (!vm_ok)
+        fprintf(stderr, "warning: cannot sample system VM counters\n");
     unsetenv("H3_ANE_LINEARS");
     if (!forward_once(directory, &text, &layout, &sigmas, &metal)) return 1;
+    vm_ok = system_vm(&vm_after_metal) && vm_ok;
     setenv("H3_ANE_LINEARS", "1", 1);
     setenv("H3_ANE_LINEAR_BLOCKS", ane_blocks, 1);
     setenv("H3_PROFILE", "1", 1);
     if (!forward_once(directory, &text, &layout, &sigmas, &ane)) return 1;
+    vm_ok = system_vm(&vm_after_ane) && vm_ok;
 
     double video_cosine = compare("video", ane.video, metal.video,
                                   metal.video_elements);
@@ -387,6 +459,20 @@ int main(int argc, char **argv) {
                                   metal.audio_elements);
     printf("load  metal=%.1f s  ane=%.1f s\n", metal.load_seconds,
            ane.load_seconds);
+    printf("memory after load:\n"
+           "  metal rss=%.1f MiB footprint=%.1f MiB compressed=%.1f MiB\n"
+           "  ane   rss=%.1f MiB footprint=%.1f MiB compressed=%.1f MiB\n",
+           (double)metal.resident_bytes / (1024.0 * 1024.0),
+           (double)metal.footprint_bytes / (1024.0 * 1024.0),
+           (double)metal.compressed_bytes / (1024.0 * 1024.0),
+           (double)ane.resident_bytes / (1024.0 * 1024.0),
+           (double)ane.footprint_bytes / (1024.0 * 1024.0),
+           (double)ane.compressed_bytes / (1024.0 * 1024.0));
+    if (vm_ok) {
+        printf("system VM deltas:\n");
+        print_vm_delta("metal", &vm_start, &vm_after_metal);
+        print_vm_delta("ane", &vm_after_metal, &vm_after_ane);
+    }
     printf("forward metal=%.3f s  ane(%s of %u blocks)=%.3f s  "
            "delta per converted block=%.3f s\n",
            metal.forward_seconds, ane_blocks, active_blocks,

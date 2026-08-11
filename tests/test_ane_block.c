@@ -328,7 +328,20 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; i++) {
         double pack = 0.0, eval = 0.0;
         uint64_t calls = 0;
-        h3_ane_projection_timings(all[i], &pack, &eval, &calls);
+        if (getenv("H3_ANE_PROFILE_STAGES")) {
+            double sync = 0.0, unpack = 0.0;
+            h3_ane_projection_stage_timings(
+                all[i], &sync, &pack, &eval, &unpack, &calls);
+            if (calls)
+                printf("  %-3s sync=%.2f ms pack=%.2f ms ane=%.2f ms "
+                       "unpack=%.2f ms\n", names[i],
+                       sync / (double)calls * 1e3,
+                       pack / (double)calls * 1e3,
+                       eval / (double)calls * 1e3,
+                       unpack / (double)calls * 1e3);
+        } else {
+            h3_ane_projection_timings(all[i], &pack, &eval, &calls);
+        }
         if (!calls) continue;
         pack_total += pack / (double)calls;
         eval_total += eval / (double)calls;

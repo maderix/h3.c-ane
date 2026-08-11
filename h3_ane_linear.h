@@ -83,6 +83,15 @@ int h3_ane_projection_apply(h3_ane_projection *projection, h3_gpu *gpu,
 void h3_ane_projection_timings(const h3_ane_projection *projection,
                                double *pack_seconds, double *eval_seconds,
                                uint64_t *calls);
+/* With H3_ANE_PROFILE_STAGES set, apply uses separate command buffers so sync,
+ * pack and unpack can be measured without attributing prior Metal work to the
+ * pack. This is a diagnostic mode and intentionally adds synchronization. */
+void h3_ane_projection_stage_timings(const h3_ane_projection *projection,
+                                     double *sync_seconds,
+                                     double *pack_seconds,
+                                     double *eval_seconds,
+                                     double *unpack_seconds,
+                                     uint64_t *calls);
 uint64_t h3_ane_projection_weight_bytes(const h3_ane_projection *projection);
 double h3_ane_projection_compile_seconds(const h3_ane_projection *projection);
 

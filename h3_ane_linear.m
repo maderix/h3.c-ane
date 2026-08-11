@@ -494,8 +494,10 @@ struct h3_ane_projection {
     uint32_t input_dim;
     uint32_t output_dim;
     uint32_t rows;
+    double sync_seconds;
     double pack_seconds;
     double eval_seconds;
+    double unpack_seconds;
     uint64_t calls;
 };
 
@@ -577,7 +579,22 @@ int h3_ane_projection_apply(h3_ane_projection *projection, h3_gpu *gpu,
     }
     uint32_t chunks = h3_ane_linear_chunks(projection->linear);
     uint32_t chunk_dim = h3_ane_linear_chunk_dim(projection->linear);
+    int profile_stages = getenv("H3_ANE_PROFILE_STAGES") != NULL;
     double started = ane_seconds();
+    if (profile_stages) {
+        if (!h3_gpu_submit(gpu)) {
+            ane_fail(error, error_size, "ANE pre-pack sync failed: %s",
+                     h3_gpu_error(gpu));
+            return 0;
+        }
+        projection->sync_seconds += ane_seconds() - started;
+        if (!h3_gpu_begin(gpu)) {
+            ane_fail(error, error_size, "cannot begin ANE pack: %s",
+                     h3_gpu_error(gpu));
+            return 0;
+        }
+        started = ane_seconds();
+    }
     for (uint32_t c = 0; c < chunks; c++)
         if (!h3_gpu_pack_ane_input_bf16(gpu, projection->plane[c], input,
                                         projection->rows, projection->input_dim,
@@ -609,6 +626,20 @@ int h3_ane_projection_apply(h3_ane_projection *projection, h3_gpu *gpu,
         ane_fail(error, error_size, "ANE unpack failed: %s", h3_gpu_error(gpu));
         return 0;
     }
+    if (profile_stages) {
+        double unpack_started = ane_seconds();
+        if (!h3_gpu_submit(gpu)) {
+            ane_fail(error, error_size, "ANE unpack submit failed: %s",
+                     h3_gpu_error(gpu));
+            return 0;
+        }
+        projection->unpack_seconds += ane_seconds() - unpack_started;
+        if (!h3_gpu_begin(gpu)) {
+            ane_fail(error, error_size, "cannot resume after ANE profiling: %s",
+                     h3_gpu_error(gpu));
+            return 0;
+        }
+    }
     projection->pack_seconds += packed - started;
     projection->eval_seconds += evaluated - packed;
     projection->calls++;
@@ -620,6 +651,23 @@ void h3_ane_projection_timings(const h3_ane_projection *projection,
                                uint64_t *calls) {
     if (pack_seconds) *pack_seconds = projection ? projection->pack_seconds : 0.0;
     if (eval_seconds) *eval_seconds = projection ? projection->eval_seconds : 0.0;
+    if (calls) *calls = projection ? projection->calls : 0;
+}
+
+void h3_ane_projection_stage_timings(const h3_ane_projection *projection,
+                                     double *sync_seconds,
+                                     double *pack_seconds,
+                                     double *eval_seconds,
+                                     double *unpack_seconds,
+                                     uint64_t *calls) {
+    if (sync_seconds)
+        *sync_seconds = projection ? projection->sync_seconds : 0.0;
+    if (pack_seconds)
+        *pack_seconds = projection ? projection->pack_seconds : 0.0;
+    if (eval_seconds)
+        *eval_seconds = projection ? projection->eval_seconds : 0.0;
+    if (unpack_seconds)
+        *unpack_seconds = projection ? projection->unpack_seconds : 0.0;
     if (calls) *calls = projection ? projection->calls : 0;
 }
 

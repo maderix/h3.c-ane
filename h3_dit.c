@@ -1255,8 +1255,9 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
 }
 
 /* H3_ANE_LINEARS moves the four block projections to the Neural Engine. The
- * fp16 graph weights are a second copy of the block matrices, so the number of
- * converted blocks is capped by H3_ANE_LINEAR_BLOCKS. */
+ * source BF16 matrices are released after all four graphs compile and load.
+ * H3_ANE_LINEAR_BLOCKS still caps the non-file-backed ANE graph residency on
+ * memory-constrained machines. */
 static int configure_ane_linears(h3_dit *dit, char *error, size_t error_size) {
     const char *request = getenv("H3_ANE_LINEARS");
     if (!request || !*request || !strcmp(request, "0")) return 1;
@@ -1315,10 +1316,22 @@ static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
             error_size);
         if (!*plan[entry].slot) return 0;
     }
+    uint64_t released_bytes = 0;
+    h3_gpu_tensor **dead_weights[4] = {
+        &block->qkv, &block->out, &block->fc1, &block->fc2
+    };
+    for (int entry = 0; entry < 4; entry++) {
+        released_bytes += (uint64_t)h3_gpu_tensor_elements(
+            *dead_weights[entry]) * sizeof(uint16_t);
+        free_tensor(dead_weights[entry]);
+    }
     dit->ane_block_count++;
-    if (getenv("H3_PROFILE"))
-        fprintf(stderr, "h3: DiT block %u projections on the Neural Engine\n",
-                index);
+    if (getenv("H3_PROFILE")) {
+        fprintf(stderr,
+                "h3: DiT block %u projections on the Neural Engine; "
+                "released %.1f MiB of dead BF16 weights\n",
+                index, (double)released_bytes / (1024.0 * 1024.0));
+    }
     return 1;
 }
 
