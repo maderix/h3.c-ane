@@ -10,12 +10,17 @@
 #include <time.h>
 
 #define H3_ANE_MAX_CHUNKS 8
+/* The graph reads [1, chunk, 1, rows]. A row count that is not a multiple of
+ * sixteen is either rejected at evaluation or, in the three counts below each
+ * multiple, silently reduced over a truncated K. Pad instead. */
+#define H3_ANE_ROW_MULTIPLE 16u
 
 struct h3_ane_linear {
     uint32_t input_dim;
     uint32_t padded_dim;
     uint32_t output_dim;
     uint32_t rows;
+    uint32_t plane_rows;
     uint32_t chunk_dim;
     uint32_t chunks;
     size_t input_bytes;
@@ -205,17 +210,21 @@ static h3_ane_linear *ane_build(const char *name, uint8_t *blob,
     linear->padded_dim = chunk_dim * chunks;
     linear->output_dim = output_dim;
     linear->rows = rows;
+    linear->plane_rows = (rows + H3_ANE_ROW_MULTIPLE - 1) /
+        H3_ANE_ROW_MULTIPLE * H3_ANE_ROW_MULTIPLE;
     linear->chunk_dim = chunk_dim;
     linear->chunks = chunks;
-    linear->input_bytes = (size_t)chunk_dim * rows * sizeof(float);
-    linear->output_bytes = (size_t)output_dim * rows * sizeof(float);
+    linear->input_bytes = (size_t)chunk_dim * linear->plane_rows * sizeof(float);
+    linear->output_bytes = (size_t)output_dim * linear->plane_rows *
+        sizeof(float);
     linear->weight_bytes = blob_bytes;
 
     @autoreleasepool {
         NSError *failure = nil;
         NSData *weights = [NSData dataWithBytesNoCopy:blob length:blob_bytes
                                          freeWhenDone:YES];
-        NSData *program = [ane_program(chunk_dim, output_dim, chunks, rows)
+        NSData *program = [ane_program(chunk_dim, output_dim, chunks,
+                                       linear->plane_rows)
             dataUsingEncoding:NSUTF8StringEncoding];
         Class descriptorClass = NSClassFromString(@"_ANEInMemoryModelDescriptor");
         Class modelClass = NSClassFromString(@"_ANEInMemoryModel");
@@ -425,6 +434,10 @@ uint32_t h3_ane_linear_rows(const h3_ane_linear *linear) {
     return linear ? linear->rows : 0;
 }
 
+uint32_t h3_ane_linear_plane_rows(const h3_ane_linear *linear) {
+    return linear ? linear->plane_rows : 0;
+}
+
 uint32_t h3_ane_linear_output_dim(const h3_ane_linear *linear) {
     return linear ? linear->output_dim : 0;
 }
@@ -528,7 +541,7 @@ h3_ane_projection *h3_ane_projection_create(h3_gpu *gpu, const char *name,
     for (uint32_t c = 0; c < chunks; c++) {
         projection->plane[c] = h3_gpu_tensor_wrap_f32(
             gpu, h3_ane_linear_input(projection->linear, c),
-            (size_t)chunk_dim * rows);
+            (size_t)chunk_dim * h3_ane_linear_plane_rows(projection->linear));
         if (!projection->plane[c]) {
             ane_fail(error, error_size, "cannot share ANE %s plane %u", name, c);
             h3_ane_projection_free(projection);
@@ -537,7 +550,7 @@ h3_ane_projection *h3_ane_projection_create(h3_gpu *gpu, const char *name,
     }
     projection->result = h3_gpu_tensor_wrap_f32(
         gpu, h3_ane_linear_output(projection->linear),
-        (size_t)output_dim * rows);
+        (size_t)output_dim * h3_ane_linear_plane_rows(projection->linear));
     if (!projection->result) {
         ane_fail(error, error_size, "cannot share ANE %s result", name);
         h3_ane_projection_free(projection);
@@ -568,7 +581,9 @@ int h3_ane_projection_apply(h3_ane_projection *projection, h3_gpu *gpu,
     for (uint32_t c = 0; c < chunks; c++)
         if (!h3_gpu_pack_ane_input_bf16(gpu, projection->plane[c], input,
                                         projection->rows, projection->input_dim,
-                                        c * chunk_dim, chunk_dim)) {
+                                        c * chunk_dim, chunk_dim,
+                                        h3_ane_linear_plane_rows(
+                                            projection->linear))) {
             ane_fail(error, error_size, "ANE pack failed: %s",
                      h3_gpu_error(gpu));
             return 0;
@@ -588,7 +603,9 @@ int h3_ane_projection_apply(h3_ane_projection *projection, h3_gpu *gpu,
     }
     if (!h3_gpu_unpack_ane_output_bf16(gpu, output, projection->result,
                                        projection->rows,
-                                       projection->output_dim)) {
+                                       projection->output_dim,
+                                       h3_ane_linear_plane_rows(
+                                           projection->linear))) {
         ane_fail(error, error_size, "ANE unpack failed: %s", h3_gpu_error(gpu));
         return 0;
     }

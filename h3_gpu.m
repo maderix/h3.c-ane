@@ -4743,15 +4743,15 @@ const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *opaque) {
 int h3_gpu_pack_ane_input_bf16(h3_gpu *opaque, h3_gpu_tensor *plane,
                                const h3_gpu_tensor *input, uint32_t rows,
                                uint32_t input_dim, uint32_t base,
-                               uint32_t chunk_dim) {
+                               uint32_t chunk_dim, uint32_t plane_rows) {
     H3GPU *gpu = GPU(opaque);
     if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
                              @"ANE pack input") ||
-        !h3_gpu_require_elements(gpu, plane, (size_t)rows * chunk_dim,
+        !h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * chunk_dim,
                                  @"ANE pack plane")) return 0;
-    struct { uint32_t rows, input_dim, base, chunk_dim; } args = {
-        rows, input_dim, base, chunk_dim};
-    return h3_gpu_dispatch_2d(gpu, @"h3_ane_pack_bf16", rows, chunk_dim,
+    struct { uint32_t rows, input_dim, base, chunk_dim, plane_rows; } args = {
+        rows, input_dim, base, chunk_dim, plane_rows};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_pack_bf16", plane_rows, chunk_dim,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:1];
@@ -4761,13 +4761,14 @@ int h3_gpu_pack_ane_input_bf16(h3_gpu *opaque, h3_gpu_tensor *plane,
 
 int h3_gpu_unpack_ane_output_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                   const h3_gpu_tensor *plane, uint32_t rows,
-                                  uint32_t output_dim) {
+                                  uint32_t output_dim, uint32_t plane_rows) {
     H3GPU *gpu = GPU(opaque);
-    if (!h3_gpu_require_elements(gpu, plane, (size_t)rows * output_dim,
+    if (!h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * output_dim,
                                  @"ANE unpack plane") ||
         !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
                              @"ANE unpack output")) return 0;
-    struct { uint32_t rows, output_dim; } args = {rows, output_dim};
+    struct { uint32_t rows, output_dim, plane_rows; } args = {
+        rows, output_dim, plane_rows};
     return h3_gpu_dispatch_2d(gpu, @"h3_ane_unpack_bf16", rows, output_dim,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:0];

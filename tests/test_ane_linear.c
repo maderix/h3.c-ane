@@ -70,10 +70,15 @@ static int run(const char *label, const char *name, h3_ane_linear *linear,
                const float *x, uint32_t chunk_dim, uint32_t chunks,
                uint32_t rows, const float *reference, size_t outputs,
                double floor_cosine) {
+    uint32_t plane_rows = h3_ane_linear_plane_rows(linear);
     size_t plane = (size_t)chunk_dim * rows;
-    for (uint32_t c = 0; c < chunks; c++)
-        memcpy(h3_ane_linear_input(linear, c), x + (size_t)c * plane,
-               plane * sizeof(float));
+    for (uint32_t c = 0; c < chunks; c++) {
+        float *destination = h3_ane_linear_input(linear, c);
+        for (uint32_t k = 0; k < chunk_dim; k++)
+            memcpy(destination + (size_t)k * plane_rows,
+                   x + (size_t)c * plane + (size_t)k * rows,
+                   (size_t)rows * sizeof(float));
+    }
     char error[256] = {0};
     if (!h3_ane_linear_eval(linear, error, sizeof(error))) {
         printf("%-4s %-9s eval failed: %s\n", name, label, error);

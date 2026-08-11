@@ -39,6 +39,8 @@ void h3_ane_linear_free(h3_ane_linear *linear);
 uint32_t h3_ane_linear_chunks(const h3_ane_linear *linear);
 uint32_t h3_ane_linear_chunk_dim(const h3_ane_linear *linear);
 uint32_t h3_ane_linear_rows(const h3_ane_linear *linear);
+/* Row count the graph really runs: rows rounded up to a multiple of sixteen. */
+uint32_t h3_ane_linear_plane_rows(const h3_ane_linear *linear);
 uint32_t h3_ane_linear_output_dim(const h3_ane_linear *linear);
 
 /* F32 [kc][rows] input plane for one chunk, and the F32 [output_dim][rows]

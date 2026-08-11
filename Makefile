@@ -81,6 +81,12 @@ h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
 h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_ane_rows_test: tests/test_ane_rows.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_dit_test: tests/test_ane_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_ane_block_test: tests/test_ane_block.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

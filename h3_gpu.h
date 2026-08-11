@@ -619,9 +619,9 @@ const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *tensor);
 int h3_gpu_pack_ane_input_bf16(h3_gpu *gpu, h3_gpu_tensor *plane,
                                const h3_gpu_tensor *input, uint32_t rows,
                                uint32_t input_dim, uint32_t base,
-                               uint32_t chunk_dim);
+                               uint32_t chunk_dim, uint32_t plane_rows);
 int h3_gpu_unpack_ane_output_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                   const h3_gpu_tensor *plane, uint32_t rows,
-                                  uint32_t output_dim);
+                                  uint32_t output_dim, uint32_t plane_rows);
 
 #endif

@@ -4336,6 +4336,7 @@ struct ane_pack_args {
     uint input_dim;
     uint base;
     uint chunk_dim;
+    uint plane_rows;
 };
 
 /* Row-major BF16 activations to one channel-major F32 reduction plane. The
@@ -4347,15 +4348,17 @@ kernel void h3_ane_pack_bf16(device const ushort *input [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]]) {
     uint row = gid.x;
     uint channel = gid.y;
-    if (row >= args.rows || channel >= args.chunk_dim) return;
+    if (row >= args.plane_rows || channel >= args.chunk_dim) return;
     uint column = args.base + channel;
-    plane[channel * args.rows + row] = column < args.input_dim ?
+    plane[channel * args.plane_rows + row] =
+        (row < args.rows && column < args.input_dim) ?
         h3_bf16_to_f32(input[row * args.input_dim + column]) : 0.0f;
 }
 
 struct ane_unpack_args {
     uint rows;
     uint output_dim;
+    uint plane_rows;
 };
 
 kernel void h3_ane_unpack_bf16(device const float *plane [[buffer(0)]],
@@ -4366,5 +4369,5 @@ kernel void h3_ane_unpack_bf16(device const float *plane [[buffer(0)]],
     uint channel = gid.y;
     if (row >= args.rows || channel >= args.output_dim) return;
     output[row * args.output_dim + channel] =
-        h3_f32_to_bf16(plane[channel * args.rows + row]);
+        h3_f32_to_bf16(plane[channel * args.plane_rows + row]);
 }
