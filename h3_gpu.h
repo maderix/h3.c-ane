@@ -610,4 +610,18 @@ int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
 
+
+/* Neural Engine staging. h3_gpu_tensor_wrap_f32 adopts page-aligned external
+ * storage without copying; the pack and unpack kernels move activations
+ * between row-major BF16 and the channel-major F32 planes the ANE reads. */
+h3_gpu_tensor *h3_gpu_tensor_wrap_f32(h3_gpu *gpu, void *base, size_t elements);
+const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *tensor);
+int h3_gpu_pack_ane_input_bf16(h3_gpu *gpu, h3_gpu_tensor *plane,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t input_dim, uint32_t base,
+                               uint32_t chunk_dim);
+int h3_gpu_unpack_ane_output_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *plane, uint32_t rows,
+                                  uint32_t output_dim);
+
 #endif

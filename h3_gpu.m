@@ -432,7 +432,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
-            @"h3_vae_encoder_group_norm_silu_f32"
+            @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_ane_pack_bf16", @"h3_ane_unpack_bf16"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -4707,5 +4708,70 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+/* Wrap page-aligned external storage, such as an IOSurface plane shared with
+ * the Neural Engine, so Metal kernels can read and write it in place. */
+h3_gpu_tensor *h3_gpu_tensor_wrap_f32(h3_gpu *opaque, void *base,
+                                      size_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !base || !elements) return NULL;
+    size_t bytes = elements * sizeof(float);
+    id<MTLBuffer> buffer = [gpu.device
+        newBufferWithBytesNoCopy:base length:bytes
+                         options:MTLResourceStorageModeShared
+                     deallocator:nil];
+    if (!buffer) {
+        h3_gpu_set_error(gpu, @"cannot wrap %zu shared bytes", bytes);
+        return NULL;
+    }
+    H3Tensor *tensor = [[H3Tensor alloc] init];
+    tensor.elements = elements;
+    tensor.bytes = bytes;
+    tensor.dtype = H3_GPU_F32;
+    tensor.buffer = buffer;
+    tensor.owner = gpu;
+    return (__bridge_retained h3_gpu_tensor *)tensor;
+}
+
+const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *opaque) {
+    if (!opaque) return NULL;
+    return TENSOR(opaque).buffer.contents;
+}
+
+int h3_gpu_pack_ane_input_bf16(h3_gpu *opaque, h3_gpu_tensor *plane,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t input_dim, uint32_t base,
+                               uint32_t chunk_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"ANE pack input") ||
+        !h3_gpu_require_elements(gpu, plane, (size_t)rows * chunk_dim,
+                                 @"ANE pack plane")) return 0;
+    struct { uint32_t rows, input_dim, base, chunk_dim; } args = {
+        rows, input_dim, base, chunk_dim};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_pack_bf16", rows, chunk_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_unpack_ane_output_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *plane, uint32_t rows,
+                                  uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, plane, (size_t)rows * output_dim,
+                                 @"ANE unpack plane") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"ANE unpack output")) return 0;
+    struct { uint32_t rows, output_dim; } args = {rows, output_dim};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_unpack_bf16", rows, output_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }

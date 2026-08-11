@@ -5,7 +5,7 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
-	-framework Accelerate
+	-framework Accelerate -framework IOSurface
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
@@ -13,7 +13,7 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
-LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
+LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m h3_ane_linear.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
@@ -79,6 +79,12 @@ h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_block_test: tests/test_ane_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_linear_test: tests/test_ane_linear.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)

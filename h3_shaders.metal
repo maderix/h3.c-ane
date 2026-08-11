@@ -4330,3 +4330,41 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+struct ane_pack_args {
+    uint rows;
+    uint input_dim;
+    uint base;
+    uint chunk_dim;
+};
+
+/* Row-major BF16 activations to one channel-major F32 reduction plane. The
+ * Neural Engine reads [1, chunk_dim, 1, rows], so the token axis is innermost
+ * and the padded tail of the K axis is zero. */
+kernel void h3_ane_pack_bf16(device const ushort *input [[buffer(0)]],
+                             device float *plane [[buffer(1)]],
+                             constant ane_pack_args &args [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.rows || channel >= args.chunk_dim) return;
+    uint column = args.base + channel;
+    plane[channel * args.rows + row] = column < args.input_dim ?
+        h3_bf16_to_f32(input[row * args.input_dim + column]) : 0.0f;
+}
+
+struct ane_unpack_args {
+    uint rows;
+    uint output_dim;
+};
+
+kernel void h3_ane_unpack_bf16(device const float *plane [[buffer(0)]],
+                               device ushort *output [[buffer(1)]],
+                               constant ane_unpack_args &args [[buffer(2)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.rows || channel >= args.output_dim) return;
+    output[row * args.output_dim + channel] =
+        h3_f32_to_bf16(plane[channel * args.rows + row]);
+}

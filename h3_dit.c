@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_ane_linear.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -46,6 +47,10 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    h3_ane_projection *ane_qkv;
+    h3_ane_projection *ane_out;
+    h3_ane_projection *ane_fc1;
+    h3_ane_projection *ane_fc2;
 } h3_dit_block;
 
 enum {
@@ -86,6 +91,9 @@ struct h3_dit {
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
+    int ane_linears;
+    unsigned ane_block_limit;
+    unsigned ane_block_count;
     int ssd_streaming;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -559,6 +567,14 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    h3_ane_projection_free(block->ane_qkv);
+    h3_ane_projection_free(block->ane_out);
+    h3_ane_projection_free(block->ane_fc1);
+    h3_ane_projection_free(block->ane_fc2);
+    block->ane_qkv = NULL;
+    block->ane_out = NULL;
+    block->ane_fc1 = NULL;
+    block->ane_fc2 = NULL;
 }
 
 static double stream_now(void) {
@@ -1238,6 +1254,74 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* H3_ANE_LINEARS moves the four block projections to the Neural Engine. The
+ * fp16 graph weights are a second copy of the block matrices, so the number of
+ * converted blocks is capped by H3_ANE_LINEAR_BLOCKS. */
+static int configure_ane_linears(h3_dit *dit, char *error, size_t error_size) {
+    const char *request = getenv("H3_ANE_LINEARS");
+    if (!request || !*request || !strcmp(request, "0")) return 1;
+    if (!h3_ane_linear_available()) {
+        fail(error, error_size,
+             "H3_ANE_LINEARS is set but the Neural Engine bridge is missing");
+        return 0;
+    }
+    if (dit->ssd_streaming) {
+        fail(error, error_size,
+             "H3_ANE_LINEARS cannot share the SSD streaming weight slots");
+        return 0;
+    }
+    if (dit->token_reduction) {
+        fail(error, error_size,
+             "H3_ANE_LINEARS needs one fixed row count; token reduction "
+             "changes it inside the core");
+        return 0;
+    }
+    dit->ane_linears = 1;
+    dit->int8_mlp = 0;
+    dit->int8_qkv = 0;
+    dit->int8_attention_out = 0;
+    dit->keep_bf16_mlp = 0;
+    dit->keep_bf16_qkv = 0;
+    dit->keep_bf16_attention_out = 0;
+    dit->nax_mlp = 0;
+    dit->fused_mlp = 0;
+    const char *limit = getenv("H3_ANE_LINEAR_BLOCKS");
+    dit->ane_block_limit = limit && *limit ?
+        (unsigned)strtoul(limit, NULL, 10) : 1;
+    return 1;
+}
+
+static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
+                             char *error, size_t error_size) {
+    struct {
+        const char *label;
+        h3_ane_projection **slot;
+        const h3_gpu_tensor *weight;
+        uint32_t input_dim;
+        uint32_t output_dim;
+    } plan[4] = {
+        {"qkv", &block->ane_qkv, block->qkv, HIDDEN, INNER * 3},
+        {"out", &block->ane_out, block->out, INNER, HIDDEN},
+        {"fc1", &block->ane_fc1, block->fc1, HIDDEN, FFN * 2},
+        {"fc2", &block->ane_fc2, block->fc2, FFN, HIDDEN}
+    };
+    for (int entry = 0; entry < 4; entry++) {
+        char label[48];
+        snprintf(label, sizeof(label), "block %u %s", index, plan[entry].label);
+        *plan[entry].slot = h3_ane_projection_create(
+            dit->gpu, label, plan[entry].weight, plan[entry].input_dim,
+            plan[entry].output_dim, dit->sequence,
+            h3_ane_linear_default_chunk(plan[entry].input_dim), error,
+            error_size);
+        if (!*plan[entry].slot) return 0;
+    }
+    dit->ane_block_count++;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: DiT block %u projections on the Neural Engine\n",
+                index);
+    return 1;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -1265,6 +1349,10 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
+            if (dit->ane_linears &&
+                dit->ane_block_count < dit->ane_block_limit &&
+                !prepare_ane_block(dit, &dit->blocks[index], index,
+                                   error, error_size)) return 0;
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1662,6 +1750,7 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
+    if (!configure_ane_linears(dit, error, error_size)) goto failed;
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -1898,7 +1987,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (weight->ane_qkv) {
+        if (!h3_ane_projection_apply(weight->ane_qkv, dit->gpu, dit->qkv,
+                                     dit->mod_attention, error, error_size))
+            return 0;
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows, HEADS,
+            HEAD_DIM, ROPE_HALF, 1e-5f), "DiT Neural Engine QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -1933,7 +2030,12 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (int8_attention_output) {
+    if (weight->ane_out) {
+        if (!h3_ane_projection_apply(weight->ane_out, dit->gpu,
+                                     dit->attention_output,
+                                     dit->attention_heads, error, error_size))
+            return 0;
+    } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
                 dit->gpu, dit->attention_output, dit->int8_activation,
@@ -1982,7 +2084,16 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
+    if (weight->ane_fc1) {
+        if (!h3_ane_projection_apply(weight->ane_fc1, dit->gpu, dit->fc1,
+                                     dit->mod_mlp, error, error_size))
+            return 0;
+        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT Neural Engine SwiGLU");
+        if (!h3_ane_projection_apply(weight->ane_fc2, dit->gpu, mlp_output,
+                                     dit->activated, error, error_size))
+            return 0;
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
