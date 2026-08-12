@@ -180,8 +180,11 @@ static void emit_const_blob(NSMutableString *text, const char *name,
 static void emit_rms_norm(NSMutableString *text, const char *tag,
                           const char *source, const char *gamma,
                           uint32_t channels, uint32_t rows) {
-    EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s_sq = mul(x=%s, y=%s)"
-          "[name=string(\"%s_sq\")];\n", channels, rows, tag, source, source,
+    /* pre-scale keeps x^2 inside fp16 for the grown late-block residuals */
+    EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s_p = mul(x=%s, y=inv256)"
+          "[name=string(\"%s_p\")];\n", channels, rows, tag, source, tag);
+    EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s_sq = mul(x=%s_p, y=%s_p)"
+          "[name=string(\"%s_sq\")];\n", channels, rows, tag, tag, tag,
          tag);
     EMIT(@"        tensor<fp16, [1,1,1,%u]> %s_s = reduce_sum(axes=ch_axis, "
           "keep_dims=keep, x=%s_sq)[name=string(\"%s_s\")];\n",
@@ -192,8 +195,8 @@ static void emit_rms_norm(NSMutableString *text, const char *tag,
           "[name=string(\"%s_e\")];\n", rows, tag, tag, tag);
     EMIT(@"        tensor<fp16, [1,1,1,%u]> %s_r = pow(x=%s_e, y=nhalf)"
           "[name=string(\"%s_r\")];\n", rows, tag, tag, tag);
-    EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s_n = mul(x=%s, y=%s_r)"
-          "[name=string(\"%s_n\")];\n", channels, rows, tag, source, tag,
+    EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s_n = mul(x=%s_p, y=%s_r)"
+          "[name=string(\"%s_n\")];\n", channels, rows, tag, tag, tag,
          tag);
     EMIT(@"        tensor<fp16, [1,%u,1,%u]> %s = mul(x=%s_n, y=%s)"
           "[name=string(\"%s\")];\n", channels, rows, tag, tag, gamma, tag);
@@ -374,6 +377,7 @@ static NSString *blk_program(const blk_projection *qkv,
                              size_t norm1, size_t norm2,
                              size_t q_norm, size_t k_norm,
                              size_t rope_cos, size_t rope_sin,
+                             size_t pad_mask, int masked,
                              const uint32_t *ends, uint32_t segments,
                              uint32_t rows) {
     const char *stage_env = getenv("H3_ANE_BLOCK_STAGE");
@@ -411,8 +415,9 @@ static NSString *blk_program(const blk_projection *qkv,
     [text appendString:
         @"        tensor<int32, [1]> ch_axis = const()[name=string(\"ch_axis\"), val=tensor<int32, [1]>([1])];\n"
          "        bool keep = const()[name=string(\"keep\"), val=bool(true)];\n"
-         "        fp16 norm_eps = const()[name=string(\"norm_eps\"), val=fp16(0.00001)];\n"
-         "        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+         "        fp16 norm_eps = const()[name=string(\"norm_eps\"), val=fp16(0.00000006)];\n"
+         "        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"
+         "        fp16 inv256 = const()[name=string(\"inv256\"), val=fp16(0.00390625)];\n"];
     EMIT(@"        fp16 inv_hidden = const()[name=string(\"inv_hidden\"), "
           "val=fp16(%.10f)];\n", 1.0 / BLK_HIDDEN);
     snprintf(shape1, sizeof(shape1), "[1,%u,1,1]", BLK_HIDDEN);
@@ -534,8 +539,17 @@ static NSString *blk_program(const blk_projection *qkv,
          BLK_HEADS, rows, rows);
     EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc2 = mul(x=sc1, y=att_scale)"
           "[name=string(\"sc2\")];\n", BLK_HEADS, rows, rows);
+    const char *scored = "sc2";
+    if (masked) {
+        char mask_shape[64];
+        snprintf(mask_shape, sizeof(mask_shape), "[1,1,1,%u]", rows);
+        emit_const_blob(text, "pad_mask", "fp16", mask_shape, pad_mask);
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc3 = add(x=sc2, y=pad_mask)"
+              "[name=string(\"sc3\")];\n", BLK_HEADS, rows, rows);
+        scored = "sc3";
+    }
     EMIT(@"        tensor<fp16, [1,%u,%u,%u]> probs = softmax(axis=sm_axis, "
-          "x=sc2)[name=string(\"probs\")];\n", BLK_HEADS, rows, rows);
+          "x=%s)[name=string(\"probs\")];\n", BLK_HEADS, rows, rows, scored);
     EMIT(@"        tensor<fp16, [1,%u,%u,%u]> att = matmul(transpose_x=bF, "
           "transpose_y=bF, x=probs, y=vh)[name=string(\"att\")];\n",
          BLK_HEADS, rows, BLK_HEAD_DIM);
@@ -629,12 +643,6 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
     }
     ends[H3_ANE_BLOCK_SEGMENTS - 1] = padded;  /* padding rides the tail */
 
-    if (padded != rows) {
-        blk_fail(error, error_size,
-                 "ANE block rows must be a multiple of %d until the pad "
-                 "attention mask lands", BLK_ROW_MULTIPLE);
-        return NULL;
-    }
     size_t bound = 512ull * 1024 * 1024;
     blk_blob blob = {calloc(bound, 1), bound, 64};
     if (!blob.data) {
@@ -674,6 +682,14 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
         free(blob.data);
         return NULL;
     }
+    size_t mask_header = 0;
+    if (padded != rows) {
+        size_t chunk;
+        __fp16 *mask = blk_blob_reserve(&blob, (size_t)padded * 2, &chunk);
+        for (uint32_t row = 0; row < padded; row++)
+            mask[row] = row < rows ? (__fp16)0.0f : (__fp16)-30000.0f;
+        mask_header = chunk;
+    }
     size_t rope_header_cos, rope_header_sin;
     __fp16 *cos_packed = blk_blob_reserve(
         &blob, (size_t)padded * BLK_ROPE_DIMS * 2, &rope_header_cos);
@@ -712,7 +728,8 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
                                          freeWhenDone:YES];
         NSString *source = blk_program(&qkv, &out, &fc1, &fc2, norm1, norm2,
                                        q_norm, k_norm, rope_header_cos,
-                                       rope_header_sin, ends,
+                                       rope_header_sin, mask_header,
+                                       padded != rows, ends,
                                        H3_ANE_BLOCK_SEGMENTS, padded);
         NSData *program = [source dataUsingEncoding:NSUTF8StringEncoding];
         Class descriptorClass = NSClassFromString(@"_ANEInMemoryModelDescriptor");
@@ -789,6 +806,9 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
         block->mod_base = IOSurfaceGetBaseAddress(block->mod_surface);
         block->output_base = IOSurfaceGetBaseAddress(block->output_surface);
         memset(block->input_base, 0, input_bytes);
+        for (uint32_t channel = 0; channel < BLK_HIDDEN; channel++)
+            for (uint32_t row = rows; row < padded; row++)
+                block->input_base[(size_t)channel * padded + row] = 1.0f;
         memset(block->mod_base, 0, mod_bytes);
         id inputs = @[
             ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(

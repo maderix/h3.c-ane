@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_ane_block.h"
 #include "h3_ane_linear.h"
 #include "h3_weights.h"
 
@@ -51,6 +52,10 @@ typedef struct {
     h3_ane_projection *ane_out;
     h3_ane_projection *ane_fc1;
     h3_ane_projection *ane_fc2;
+    h3_ane_block *full;
+    h3_gpu_tensor *full_in;
+    h3_gpu_tensor *full_out;
+    uint16_t *full_mods;
 } h3_dit_block;
 
 enum {
@@ -106,6 +111,9 @@ struct h3_dit {
      * official checkpoint interleaves [head][q/k/v][dim], which every h3
      * attention kernel expects. Detected via the adaln_t_table marker. */
     int conventional_qkv;
+    unsigned ane_full_limit;
+    float *ane_rope_cos;
+    float *ane_rope_sin;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -610,6 +618,12 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    h3_ane_block_free(block->full);
+    block->full = NULL;
+    free_tensor(&block->full_in);
+    free_tensor(&block->full_out);
+    free(block->full_mods);
+    block->full_mods = NULL;
     h3_ane_projection_free(block->ane_qkv);
     h3_ane_projection_free(block->ane_out);
     h3_ane_projection_free(block->ane_fc1);
@@ -1072,6 +1086,14 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
             }
         }
     }
+    if (dit->ane_full_limit) {
+        dit->ane_rope_cos = malloc(count * sizeof(*dit->ane_rope_cos));
+        dit->ane_rope_sin = malloc(count * sizeof(*dit->ane_rope_sin));
+        if (dit->ane_rope_cos && dit->ane_rope_sin) {
+            memcpy(dit->ane_rope_cos, cosines, count * sizeof(*cosines));
+            memcpy(dit->ane_rope_sin, sines, count * sizeof(*sines));
+        }
+    }
     h3_gpu_tensor *cos_f32 = h3_gpu_tensor_from_f32(dit->gpu, cosines, count);
     h3_gpu_tensor *sin_f32 = h3_gpu_tensor_from_f32(dit->gpu, sines, count);
     h3_gpu_tensor *reduced_cos_f32 = reduced_count ?
@@ -1508,6 +1530,115 @@ static int block_projections_int8(const h3_dit *dit, unsigned index) {
     return 1;
 }
 
+/* Full-block Neural Engine residency: the graph owns norms/adaln/attention,
+ * so the block skips streaming entirely. Requires the plain 3-segment
+ * text/audio/video layout. */
+static int full_block_layout_ok(const h3_dit *dit, uint32_t *ends) {
+    if (dit->layout.segment_count != 3 ||
+        dit->layout.segments[0].kind != H3_SEG_TEXT ||
+        dit->layout.segments[1].kind != H3_SEG_AUDIO ||
+        dit->layout.segments[2].kind != H3_SEG_VIDEO ||
+        dit->token_reduction)
+        return 0;
+    for (int seg = 0; seg < 3; seg++)
+        ends[seg] = (uint32_t)dit->layout.segments[seg].stop;
+    return 1;
+}
+
+static int prepare_full_ane_block(h3_dit *dit, h3_dit_block *block,
+                                  unsigned index, const uint32_t *ends,
+                                  char *error, size_t error_size) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
+    block->full = h3_ane_block_create(dit->weights, prefix, dit->sequence,
+                                      ends, dit->ane_rope_cos,
+                                      dit->ane_rope_sin, error, error_size);
+    if (!block->full) return 0;
+    uint32_t padded = h3_ane_block_padded_rows(block->full);
+    block->full_in = h3_gpu_tensor_wrap_f32(
+        dit->gpu, h3_ane_block_input(block->full), (size_t)HIDDEN * padded);
+    block->full_out = h3_gpu_tensor_wrap_f32(
+        dit->gpu, h3_ane_block_output(block->full), (size_t)HIDDEN * padded);
+    const h3_gpu_tensor *schedule = h3_dit_schedule_block(dit->schedule,
+                                                          index);
+    uint32_t time_rows = h3_dit_schedule_time_rows(dit->schedule);
+    size_t mod_elements = (size_t)time_rows * H3_DIT_MODALITIES *
+                          H3_DIT_ADALN_SLOTS * HIDDEN;
+    block->full_mods = malloc(mod_elements * sizeof(*block->full_mods));
+    if (!block->full_in || !block->full_out || !block->full_mods ||
+        !h3_gpu_tensor_read_bf16((h3_gpu_tensor *)schedule,
+                                 block->full_mods, mod_elements)) {
+        fail(error, error_size, "cannot stage full ANE block %u", index);
+        return 0;
+    }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: DiT block %u fully on the Neural Engine "
+                "(%.1f MiB, compile %.2fs)\n", index,
+                (double)h3_ane_block_weight_bytes(block->full) /
+                    (1024.0 * 1024.0),
+                h3_ane_block_compile_seconds(block->full));
+    return 1;
+}
+
+static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step) {
+    float *destination = h3_ane_block_mod(block->full);
+    uint32_t rows[3] = {
+        h3_dit_schedule_video_row(dit->schedule, step),   /* text tag 1 */
+        h3_dit_schedule_audio_row(dit->schedule, step),   /* audio tag 2 */
+        h3_dit_schedule_video_row(dit->schedule, step)    /* video tag 0 */
+    };
+    uint32_t tags[3] = {1, 2, 0};
+    for (int seg = 0; seg < 3; seg++)
+        for (int slot = 0; slot < H3_ANE_BLOCK_SLOTS; slot++) {
+            size_t base = (((size_t)rows[seg] * H3_DIT_MODALITIES + tags[seg]) *
+                           H3_DIT_ADALN_SLOTS + slot) * HIDDEN;
+            for (uint32_t channel = 0; channel < HIDDEN; channel++) {
+                uint32_t bits =
+                    (uint32_t)block->full_mods[base + channel] << 16;
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                destination[(size_t)channel * H3_ANE_BLOCK_MOD_WIDTH +
+                            seg * H3_ANE_BLOCK_SLOTS + slot] = value;
+            }
+        }
+}
+
+static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
+                              char *error, size_t error_size) {
+    fill_full_mods(dit, block, step);
+    uint32_t padded = h3_ane_block_padded_rows(block->full);
+    if (!gpu_op(dit, h3_gpu_pack_ane_input_bf16(
+                    dit->gpu, block->full_in, dit->hidden, dit->sequence,
+                    HIDDEN, 0, HIDDEN, padded),
+                error, error_size, "pack full ANE block input") ||
+        !gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                "submit before full ANE block"))
+        return 0;
+    if (!h3_ane_block_eval(block->full, error, error_size)) return 0;
+    if (!gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                "resume after full ANE block") ||
+        !gpu_op(dit, h3_gpu_unpack_ane_output_bf16(
+                    dit->gpu, dit->hidden, block->full_out, dit->sequence,
+                    HIDDEN, padded),
+                error, error_size, "unpack full ANE block output"))
+        return 0;
+    return 1;
+}
+
+static unsigned next_streamed_block(const h3_dit *dit, unsigned block) {
+    for (unsigned index = block + 1; index < H3_DIT_BLOCKS; index++)
+        if (dit->block_active[index] && !dit->blocks[index].full)
+            return index;
+    return H3_DIT_BLOCKS;
+}
+
+static unsigned first_streamed_block(const h3_dit *dit) {
+    for (unsigned index = 0; index < H3_DIT_BLOCKS; index++)
+        if (dit->block_active[index] && !dit->blocks[index].full)
+            return index;
+    return H3_DIT_BLOCKS;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -1519,7 +1650,18 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
         if (dit->ssd_streaming) {
-            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+            uint32_t full_ends[3];
+            unsigned full_count = 0;
+            for (unsigned scan = 0; scan < index; scan++)
+                if (dit->blocks[scan].full) full_count++;
+            if (full_count < dit->ane_full_limit &&
+                dit->ane_rope_cos && dit->ane_rope_sin &&
+                full_block_layout_ok(dit, full_ends) &&
+                block_projections_int8(dit, index)) {
+                if (!prepare_full_ane_block(dit, &dit->blocks[index], index,
+                                            full_ends, error, error_size))
+                    return 0;
+            } else if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
@@ -1555,10 +1697,11 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
             !allocate_stream_slot(dit, &dit->stream_slots[1],
                                   error, error_size)) return 0;
-        unsigned first = first_active_block(dit);
+        unsigned first = first_streamed_block(dit);
         if (first == H3_DIT_BLOCKS) {
-            fail(error, error_size, "SSD stream has no active DiT block");
-            return 0;
+            /* every active block lives on the Neural Engine */
+            dit->stream_ready_layer = H3_DIT_BLOCKS;
+            goto stream_ready;
         }
         h3_dit_stream_job job = {
             .dit = dit, .layer = first, .slot = 0
@@ -1572,6 +1715,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->stream_ready_slot = 0;
         dit->stream_bytes += job.bytes;
         dit->stream_read_seconds += job.seconds;
+stream_ready:;
     }
     dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
                             VIDEO_PATCH, error, error_size);
@@ -1910,6 +2054,9 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->conventional_qkv =
         h3_weight_find(dit->weights, "adaln_t_table", NULL) != NULL;
+    const char *full_env = getenv("H3_ANE_FULL_BLOCKS");
+    dit->ane_full_limit = full_env && *full_env ?
+        (unsigned)strtoul(full_env, NULL, 10) : 0;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -2527,6 +2674,12 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                                dit, error, error_size)) return 0;
             }
             if (!dit->block_active[block]) continue;
+            if (dit->blocks[block].full) {
+                if (!run_full_ane_block(dit, &dit->blocks[block], step,
+                                        error, error_size)) return 0;
+                completed_blocks++;
+                continue;
+            }
             unsigned next_block = block + 1;
             int next_is_token_boundary = use_token_reduction &&
                 (next_block == dit->token_reduction_begin ||
@@ -2557,9 +2710,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 streamed_weight.fc2 = slot->fc2;
                 weight = &streamed_weight;
 
-                unsigned future = next_active_block(dit, block);
+                unsigned future = next_streamed_block(dit, block);
                 if (future == H3_DIT_BLOCKS)
-                    future = first_active_block(dit);
+                    future = first_streamed_block(dit);
                 stream_job = (h3_dit_stream_job){
                     .dit = dit,
                     .layer = future,
@@ -3353,6 +3506,8 @@ void h3_dit_free(h3_dit *dit) {
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
     free_tensor(&dit->refined_text);
+    free(dit->ane_rope_cos);
+    free(dit->ane_rope_sin);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
     free_tensor(&dit->reduced_rope_cos);
