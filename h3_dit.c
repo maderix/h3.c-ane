@@ -112,6 +112,7 @@ struct h3_dit {
      * attention kernel expects. Detected via the adaln_t_table marker. */
     int conventional_qkv;
     unsigned ane_full_limit;
+    int ane_rotate;
     float *ane_rope_cos;
     float *ane_rope_sin;
     int keep_bf16_mlp;
@@ -1573,15 +1574,20 @@ static int prepare_full_ane_block(h3_dit *dit, h3_dit_block *block,
     }
     if (getenv("H3_PROFILE"))
         fprintf(stderr, "h3: DiT block %u fully on the Neural Engine "
-                "(%.1f MiB, %s %.2fs)\n", index,
+                "(%.1f MiB, %s %.2fs%s)\n", index,
                 (double)h3_ane_block_weight_bytes(block->full) /
                     (1024.0 * 1024.0),
                 h3_ane_block_cache_hit(block->full) ? "cached load" : "compile",
-                h3_ane_block_compile_seconds(block->full));
+                h3_ane_block_compile_seconds(block->full),
+                dit->ane_rotate ? ", rotating" : "");
+    if (dit->ane_rotate &&
+        !h3_ane_block_unload(block->full, error, error_size))
+        return 0;
     return 1;
 }
 
-static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step) {
+static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step,
+                           float gate_scale) {
     float *destination = h3_ane_block_mod(block->full);
     uint32_t rows[3] = {
         h3_dit_schedule_video_row(dit->schedule, step),   /* text tag 1 */
@@ -1591,6 +1597,9 @@ static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step) {
     uint32_t tags[3] = {1, 2, 0};
     for (int seg = 0; seg < 3; seg++)
         for (int slot = 0; slot < H3_ANE_BLOCK_SLOTS; slot++) {
+            /* Slots 2 and 5 gate the residual adds; they carry the 1/s of
+             * the fp16 range guard so the whole block runs at h/s. */
+            float slot_scale = slot == 2 || slot == 5 ? gate_scale : 1.0f;
             size_t base = (((size_t)rows[seg] * H3_DIT_MODALITIES + tags[seg]) *
                            H3_DIT_ADALN_SLOTS + slot) * HIDDEN;
             for (uint32_t channel = 0; channel < HIDDEN; channel++) {
@@ -1599,14 +1608,31 @@ static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step) {
                 float value;
                 memcpy(&value, &bits, sizeof(value));
                 destination[(size_t)channel * H3_ANE_BLOCK_MOD_WIDTH +
-                            seg * H3_ANE_BLOCK_SLOTS + slot] = value;
+                            seg * H3_ANE_BLOCK_SLOTS + slot] =
+                    value * slot_scale;
             }
         }
 }
 
+/* Smallest power of two that brings the peak under 16384 (4x headroom to
+ * the fp16 max for in-block residual growth). Power-of-two scaling only
+ * shifts the fp16 exponent, so the guard is lossless. */
+static float ane_range_scale(const float *plane, size_t count) {
+    float peak = 0;
+    for (size_t i = 0; i < count; i++) {
+        float value = fabsf(plane[i]);
+        if (value > peak) peak = value;
+    }
+    float scale = 1.0f;
+    while (peak / scale > 16384.0f) scale *= 2.0f;
+    return scale;
+}
+
 static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
                               char *error, size_t error_size) {
-    fill_full_mods(dit, block, step);
+    if (dit->ane_rotate &&
+        !h3_ane_block_reload(block->full, error, error_size))
+        return 0;
     uint32_t padded = h3_ane_block_padded_rows(block->full);
     if (!gpu_op(dit, h3_gpu_pack_ane_input_bf16(
                     dit->gpu, block->full_in, dit->hidden, dit->sequence,
@@ -1615,13 +1641,64 @@ static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
         !gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                 "submit before full ANE block"))
         return 0;
-    if (!h3_ane_block_eval(block->full, error, error_size)) return 0;
+    float *ane_in = h3_ane_block_input(block->full);
+    float *ane_out = h3_ane_block_output(block->full);
+    size_t plane_count = (size_t)HIDDEN * padded;
+    float range = ane_range_scale(ane_in, plane_count);
+    float applied = 1.0f;
+    for (int attempt = 0; ; attempt++) {
+        if (range != applied) {
+            float adjust = applied / range;
+            for (size_t i = 0; i < plane_count; i++) ane_in[i] *= adjust;
+            applied = range;
+        }
+        fill_full_mods(dit, block, step, 1.0f / range);
+        if (!h3_ane_block_eval(block->full, error, error_size)) return 0;
+        /* The residual can grow inside the block past what the input peak
+         * predicts; a near-max or non-finite output re-runs at 4x scale. */
+        double out_peak = 0;
+        size_t out_bad = 0;
+        for (size_t i = 0; i < plane_count; i++) {
+            float value = ane_out[i];
+            if (!isfinite(value)) out_bad++;
+            else if (fabsf(value) > out_peak) out_peak = fabsf(value);
+        }
+        if ((out_bad == 0 && out_peak < 40000.0) || attempt >= 3) {
+            if (out_bad && getenv("H3_PROFILE"))
+                fprintf(stderr, "h3: ANE block %ld still non-finite after "
+                        "range retries\n", (long)(block - dit->blocks));
+            break;
+        }
+        range *= 4.0f;
+    }
+    if (range > 1.0f)
+        for (size_t i = 0; i < plane_count; i++) ane_out[i] *= range;
+    if (getenv("H3_ANE_DEBUG_RANGE")) {
+        const float *planes[2] = {h3_ane_block_input(block->full),
+                                  h3_ane_block_output(block->full)};
+        const char *tags[2] = {"in", "out"};
+        for (int plane = 0; plane < 2; plane++) {
+            double peak = 0;
+            size_t bad = 0;
+            for (size_t i = 0; i < (size_t)HIDDEN * padded; i++) {
+                float value = planes[plane][i];
+                if (!isfinite(value)) bad++;
+                else if (fabsf(value) > peak) peak = fabsf(value);
+            }
+            fprintf(stderr, "h3: ane range block %ld step %d %s "
+                    "peak=%.3e nonfinite=%zu\n",
+                    (long)(block - dit->blocks), step, tags[plane], peak, bad);
+        }
+    }
     if (!gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                 "resume after full ANE block") ||
         !gpu_op(dit, h3_gpu_unpack_ane_output_bf16(
                     dit->gpu, dit->hidden, block->full_out, dit->sequence,
                     HIDDEN, padded),
                 error, error_size, "unpack full ANE block output"))
+        return 0;
+    if (dit->ane_rotate &&
+        !h3_ane_block_unload(block->full, error, error_size))
         return 0;
     return 1;
 }
@@ -2058,6 +2135,8 @@ static h3_dit *load_dit(const char *weight_directory,
     const char *full_env = getenv("H3_ANE_FULL_BLOCKS");
     dit->ane_full_limit = full_env && *full_env ?
         (unsigned)strtoul(full_env, NULL, 10) : 0;
+    const char *rotate_env = getenv("H3_ANE_ROTATE");
+    dit->ane_rotate = rotate_env && *rotate_env && strcmp(rotate_env, "0");
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
