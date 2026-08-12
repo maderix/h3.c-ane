@@ -19,8 +19,8 @@ tensors in and out and decode the final video.
 
 ![torture](assets/h3_ane_torture_scene.gif)
 
-The obligatory self portrait, also generated on the Neural Engine: the model
-depicting its own working conditions.
+The obligatory self portrait, also generated on the Neural Engine (20
+denoise steps): the model depicting its own working conditions.
 
 ## Why
 
