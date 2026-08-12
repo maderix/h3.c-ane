@@ -35,6 +35,30 @@ reverse-engineers the private ANE APIs sufficiently to train networks on the
 Neural Engine. That work established the MIL behavior, alignment rules, and
 bridge techniques used here.
 
+## What is different from h3.c
+
+Everything upstream still works. The ANE path is opt-in through environment
+variables, and with them unset this fork behaves like h3.c. The differences:
+
+- The transformer runs on the Neural Engine. Set `H3_ANE_FULL_BLOCKS=50` and
+  `H3_ANE_ROTATE=1` and all 50 DiT blocks execute as ANE programs
+  (`h3_ane_block.m`, `h3_ane_linear.m`, `h3_ane_bridge.m`). Upstream runs
+  them on the GPU with Metal.
+- It targets a small machine. Upstream keeps the BF16 model resident, which
+  wants a 64GB or larger Mac. This fork streams the 21GB int8 checkpoint
+  from SSD and peaks at about 2GB of RAM, so a base 24GB M4 works.
+- It consumes the ComfyUI int8 ConvRot checkpoint instead of the official
+  BF16 release: int8 weights with Hadamard-rotated rows, adaLN lookup
+  tables instead of the time-embedding MLP, a conventional-order QKV that
+  gets regrouped at load, and an fp16 video VAE (`h3_convrot.c` and the
+  loader changes in `h3_weights.c`).
+- Text conditioning is precomputed. The 51GB text encoder never runs on the
+  Mac; `scripts/mint_h3_conditioning.py` produces a small `.h3cd` file on
+  any GPU box and `H3_CONDITIONING_FILE` consumes it.
+- New tests cover the ANE pieces: the int8 projection contract, the full
+  block graph against a float64 reference, model rotation, and the compile
+  cache (`tests/test_ane_*.c`, `tests/test_convrot_weights.c`).
+
 ## Tutorial
 
 ### 1. Build
