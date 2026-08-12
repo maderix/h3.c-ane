@@ -8,8 +8,8 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework Accelerate -framework IOSurface
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_convrot.c \
+	h3_text_encoder.c h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -93,6 +93,9 @@ h3_ane_block_test: tests/test_ane_block.o $(LIB_OBJ)
 h3_ane_linear_test: tests/test_ane_linear.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_convrot_tests: tests/test_convrot_weights.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -111,11 +114,12 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
-	h3_av_mux_test \
+	h3_av_mux_test h3_convrot_tests \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_tests
+	./h3_convrot_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \

@@ -31,4 +31,12 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const uint64_t *shape,
                                   char *error, size_t error_size);
 
+/* Raw comfy-quants int8_tensorwise projection: caller frees quantized and
+ * scales. convrot_group_size is 0 when the stored rows are unrotated. */
+int h3_weight_load_int8_raw(const h3_weight_store *store, const char *name,
+                            uint64_t rows, uint64_t columns,
+                            int8_t **quantized, float **scales,
+                            int *convrot_group_size,
+                            char *error, size_t error_size);
+
 #endif
