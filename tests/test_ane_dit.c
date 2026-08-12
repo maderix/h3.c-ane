@@ -458,8 +458,7 @@ static double compare(const char *label, const float *got, const float *want,
 }
 
 int main(int argc, char **argv) {
-    const char *directory = argc > 1 ? argv[1] :
-        "/Users/maderix/m4scratch/h3_synth_dit";
+    const char *directory = argc > 1 ? argv[1] : "h3_synth_dit";
     const char *ane_blocks = argc > 2 ? argv[2] : "2";
     if (argc > 3) active_blocks = (unsigned)atoi(argv[3]);
     int8_mint = argc > 4 && !strcmp(argv[4], "int8");

@@ -5,6 +5,7 @@
 #include "h3_ane_linear.h"
 #include "h3_weights.h"
 
+#include <Accelerate/Accelerate.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -113,6 +114,16 @@ struct h3_dit {
     int conventional_qkv;
     unsigned ane_full_limit;
     int ane_rotate;
+    /* Background {unload k, reload k+1} so the ~250ms compiled-net disk read
+     * overlaps the next block's compute instead of serializing with it. */
+    pthread_t ane_rotate_thread;
+    int ane_rotate_pending;
+    struct h3_ane_rotate_job {
+        h3_ane_block *unload;
+        h3_ane_block *reload;
+        int ok;
+        char error[256];
+    } ane_rotate_job;
     float *ane_rope_cos;
     float *ane_rope_sin;
     int keep_bf16_mlp;
@@ -1340,18 +1351,6 @@ static void configure_active_blocks(h3_dit *dit, unsigned active) {
     }
 }
 
-static unsigned first_active_block(const h3_dit *dit) {
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
-        if (dit->block_active[block]) return block;
-    return H3_DIT_BLOCKS;
-}
-
-static unsigned next_active_block(const h3_dit *dit, unsigned current) {
-    for (unsigned block = current + 1; block < H3_DIT_BLOCKS; block++)
-        if (dit->block_active[block]) return block;
-    return H3_DIT_BLOCKS;
-}
-
 static void configure_gate_ranked_blocks(h3_dit *dit) {
     const char *policy = getenv("H3_DIT_LAYER_POLICY");
     if ((policy && !strcmp(policy, "uniform")) ||
@@ -1619,20 +1618,59 @@ static void fill_full_mods(h3_dit *dit, h3_dit_block *block, int step,
  * shifts the fp16 exponent, so the guard is lossless. */
 static float ane_range_scale(const float *plane, size_t count) {
     float peak = 0;
-    for (size_t i = 0; i < count; i++) {
-        float value = fabsf(plane[i]);
-        if (value > peak) peak = value;
-    }
+    vDSP_maxmgv(plane, 1, &peak, count);
     float scale = 1.0f;
     while (peak / scale > 16384.0f) scale *= 2.0f;
     return scale;
 }
 
+static void *ane_rotate_worker(void *opaque) {
+    struct h3_ane_rotate_job *job = opaque;
+    job->ok = 1;
+    if (job->unload &&
+        !h3_ane_block_unload(job->unload, job->error, sizeof(job->error)))
+        job->ok = 0;
+    if (job->ok && job->reload &&
+        !h3_ane_block_reload(job->reload, job->error, sizeof(job->error)))
+        job->ok = 0;
+    return NULL;
+}
+
+static int ane_rotate_join(h3_dit *dit, char *error, size_t error_size) {
+    if (!dit->ane_rotate_pending) return 1;
+    pthread_join(dit->ane_rotate_thread, NULL);
+    dit->ane_rotate_pending = 0;
+    if (!dit->ane_rotate_job.ok) {
+        fail(error, error_size, "%s", dit->ane_rotate_job.error);
+        return 0;
+    }
+    return 1;
+}
+
+/* The next full block after `block` in step order, wrapping to the next
+ * denoise step's first full block. */
+static h3_ane_block *ane_rotate_next(h3_dit *dit, h3_dit_block *block) {
+    unsigned index = (unsigned)(block - dit->blocks);
+    for (unsigned scan = 1; scan <= H3_DIT_BLOCKS; scan++) {
+        unsigned candidate = (index + scan) % H3_DIT_BLOCKS;
+        if (dit->block_active[candidate] && dit->blocks[candidate].full)
+            return dit->blocks[candidate].full;
+    }
+    return NULL;
+}
+
 static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
                               char *error, size_t error_size) {
-    if (dit->ane_rotate &&
-        !h3_ane_block_reload(block->full, error, error_size))
-        return 0;
+    if (dit->ane_rotate) {
+        if (dit->ane_rotate_pending &&
+            dit->ane_rotate_job.reload == block->full) {
+            if (!ane_rotate_join(dit, error, error_size)) return 0;
+        } else {
+            if (!ane_rotate_join(dit, error, error_size)) return 0;
+            if (!h3_ane_block_reload(block->full, error, error_size))
+                return 0;
+        }
+    }
     uint32_t padded = h3_ane_block_padded_rows(block->full);
     if (!gpu_op(dit, h3_gpu_pack_ane_input_bf16(
                     dit->gpu, block->full_in, dit->hidden, dit->sequence,
@@ -1641,6 +1679,19 @@ static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
         !gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                 "submit before full ANE block"))
         return 0;
+    if (dit->ane_rotate) {
+        /* Reload the next block while this one computes: the ~250ms cold
+         * read of its compiled net hides behind the ~280ms evaluation. */
+        h3_ane_block *next = ane_rotate_next(dit, block);
+        if (next && next != block->full) {
+            dit->ane_rotate_job.unload = NULL;
+            dit->ane_rotate_job.reload = next;
+            dit->ane_rotate_job.ok = 0;
+            if (pthread_create(&dit->ane_rotate_thread, NULL,
+                               ane_rotate_worker, &dit->ane_rotate_job) == 0)
+                dit->ane_rotate_pending = 1;
+        }
+    }
     float *ane_in = h3_ane_block_input(block->full);
     float *ane_out = h3_ane_block_output(block->full);
     size_t plane_count = (size_t)HIDDEN * padded;
@@ -1649,21 +1700,19 @@ static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
     for (int attempt = 0; ; attempt++) {
         if (range != applied) {
             float adjust = applied / range;
-            for (size_t i = 0; i < plane_count; i++) ane_in[i] *= adjust;
+            vDSP_vsmul(ane_in, 1, &adjust, ane_in, 1, plane_count);
             applied = range;
         }
         fill_full_mods(dit, block, step, 1.0f / range);
         if (!h3_ane_block_eval(block->full, error, error_size)) return 0;
         /* The residual can grow inside the block past what the input peak
-         * predicts; a near-max or non-finite output re-runs at 4x scale. */
-        double out_peak = 0;
-        size_t out_bad = 0;
-        for (size_t i = 0; i < plane_count; i++) {
-            float value = ane_out[i];
-            if (!isfinite(value)) out_bad++;
-            else if (fabsf(value) > out_peak) out_peak = fabsf(value);
-        }
-        if ((out_bad == 0 && out_peak < 40000.0) || attempt >= 3) {
+         * predicts; a near-max or non-finite output re-runs at 4x scale.
+         * maxmgv catches infinities; the sum catches NaN. */
+        float out_peak = 0, out_sum = 0;
+        vDSP_maxmgv(ane_out, 1, &out_peak, plane_count);
+        vDSP_sve(ane_out, 1, &out_sum, plane_count);
+        int out_bad = !isfinite(out_peak) || !isfinite(out_sum);
+        if ((!out_bad && out_peak < 40000.0f) || attempt >= 3) {
             if (out_bad && getenv("H3_PROFILE"))
                 fprintf(stderr, "h3: ANE block %ld still non-finite after "
                         "range retries\n", (long)(block - dit->blocks));
@@ -1672,7 +1721,7 @@ static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
         range *= 4.0f;
     }
     if (range > 1.0f)
-        for (size_t i = 0; i < plane_count; i++) ane_out[i] *= range;
+        vDSP_vsmul(ane_out, 1, &range, ane_out, 1, plane_count);
     if (getenv("H3_ANE_DEBUG_RANGE")) {
         const float *planes[2] = {h3_ane_block_input(block->full),
                                   h3_ane_block_output(block->full)};
@@ -1690,15 +1739,15 @@ static int run_full_ane_block(h3_dit *dit, h3_dit_block *block, int step,
                     (long)(block - dit->blocks), step, tags[plane], peak, bad);
         }
     }
+    if (dit->ane_rotate &&
+        !h3_ane_block_unload(block->full, error, error_size))
+        return 0;
     if (!gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                 "resume after full ANE block") ||
         !gpu_op(dit, h3_gpu_unpack_ane_output_bf16(
                     dit->gpu, dit->hidden, block->full_out, dit->sequence,
                     HIDDEN, padded),
                 error, error_size, "unpack full ANE block output"))
-        return 0;
-    if (dit->ane_rotate &&
-        !h3_ane_block_unload(block->full, error, error_size))
         return 0;
     return 1;
 }
@@ -3572,6 +3621,10 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
+    if (dit->ane_rotate_pending) {
+        pthread_join(dit->ane_rotate_thread, NULL);
+        dit->ane_rotate_pending = 0;
+    }
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
