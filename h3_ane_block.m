@@ -897,6 +897,45 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
     return block;
 }
 
+int h3_ane_block_unload(h3_ane_block *block, char *error, size_t error_size) {
+    if (!block || !block->model) {
+        blk_fail(error, error_size, "no ANE block model to unload");
+        return 0;
+    }
+    @autoreleasepool {
+        NSError *failure = nil;
+        if (!((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
+                (__bridge id)block->model, @selector(unloadWithQoS:error:), 21,
+                &failure)) {
+            blk_fail(error, error_size, "ANE block unload failed: %s",
+                     failure ? failure.localizedDescription.UTF8String : "?");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int h3_ane_block_reload(h3_ane_block *block, char *error, size_t error_size) {
+    if (!block || !block->model || !block->temporary_directory) {
+        blk_fail(error, error_size, "no ANE block model to reload");
+        return 0;
+    }
+    @autoreleasepool {
+        NSString *directory = @(block->temporary_directory);
+        h3_ane_cache_restore((__bridge void *)directory.lastPathComponent,
+                             (__bridge void *)directory);
+        NSError *failure = nil;
+        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                (__bridge id)block->model, @selector(loadWithQoS:options:error:),
+                21, @{}, &failure)) {
+            blk_fail(error, error_size, "ANE block reload failed: %s",
+                     failure ? failure.localizedDescription.UTF8String : "?");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void h3_ane_block_free(h3_ane_block *block) {
     if (!block) return;
     @autoreleasepool {

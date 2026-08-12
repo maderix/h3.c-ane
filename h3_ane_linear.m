@@ -106,10 +106,27 @@ bool h3_ane_cache_restore(void *ident, void *dir) {
     return true;
 }
 
+/* Only the compiled artifacts are kept: `data` embeds the constants, so the
+ * 381MB weights copy and the MIL text are dead weight in an entry. */
 void h3_ane_cache_store(void *ident, void *dir) {
     NSString *identifier = (__bridge NSString *)ident;
+    NSString *directory = (__bridge NSString *)dir;
     NSString *entry = ane_cache_entry(identifier);
-    if (!ane_mirror((__bridge NSString *)dir, entry)) return;
+    NSFileManager *files = [NSFileManager defaultManager];
+    [files removeItemAtPath:entry error:nil];
+    if (![files createDirectoryAtPath:entry withIntermediateDirectories:YES
+                           attributes:nil error:nil]) return;
+    for (NSString *name in
+         [files contentsOfDirectoryAtPath:directory error:nil]) {
+        if ([name isEqualToString:@"weights"] ||
+            [name isEqualToString:@"model.mil"]) continue;
+        NSString *from = [directory stringByAppendingPathComponent:name];
+        NSString *to = [entry stringByAppendingPathComponent:name];
+        if (![files linkItemAtPath:from toPath:to error:nil]) {
+            [files removeItemAtPath:to error:nil];
+            if (![files copyItemAtPath:from toPath:to error:nil]) return;
+        }
+    }
     [[NSData data] writeToFile:
         [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
 }

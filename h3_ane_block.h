@@ -45,6 +45,11 @@ uint32_t h3_ane_block_padded_rows(const h3_ane_block *block);
 int h3_ane_block_eval(h3_ane_block *block, char *error, size_t error_size);
 double h3_ane_block_compile_seconds(const h3_ane_block *block);
 bool h3_ane_block_cache_hit(const h3_ane_block *block);
+
+/* Residency rotation: unload releases the wired compiled net but keeps the
+ * handle, surfaces, and request; reload re-wires it from the compile cache. */
+int h3_ane_block_unload(h3_ane_block *block, char *error, size_t error_size);
+int h3_ane_block_reload(h3_ane_block *block, char *error, size_t error_size);
 uint64_t h3_ane_block_weight_bytes(const h3_ane_block *block);
 
 #endif

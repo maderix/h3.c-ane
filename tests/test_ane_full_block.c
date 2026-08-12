@@ -433,7 +433,48 @@ int main(int argc, char **argv) {
     }
     printf("timing S=%u: best %.1f ms/block (compile %.2fs)\n", timing_rows,
            best * 1e3, h3_ane_block_compile_seconds(block));
+
+    /* Residency rotation: unload -> reload -> eval must stay bit-identical,
+     * and the cycle must be cheap enough to hide behind a block eval. */
+    size_t out_bytes = (size_t)HIDDEN *
+        h3_ane_block_padded_rows(block) * sizeof(float);
+    float *pinned = malloc(out_bytes);
+    memcpy(pinned, h3_ane_block_output(block), out_bytes);
+    int rotation_ok = 1;
+    double unload_best = 1e30, reload_best = 1e30;
+    for (int cycle = 0; cycle < 3; cycle++) {
+        double started = now_seconds();
+        if (!h3_ane_block_unload(block, error, sizeof(error))) {
+            fprintf(stderr, "unload: %s\n", error);
+            rotation_ok = 0;
+            break;
+        }
+        double unloaded = now_seconds();
+        if (!h3_ane_block_reload(block, error, sizeof(error))) {
+            fprintf(stderr, "reload: %s\n", error);
+            rotation_ok = 0;
+            break;
+        }
+        double reloaded = now_seconds();
+        if (!h3_ane_block_eval(block, error, sizeof(error))) {
+            fprintf(stderr, "rotated eval: %s\n", error);
+            rotation_ok = 0;
+            break;
+        }
+        if (memcmp(pinned, h3_ane_block_output(block), out_bytes)) {
+            fprintf(stderr, "rotated eval output differs\n");
+            rotation_ok = 0;
+            break;
+        }
+        if (unloaded - started < unload_best) unload_best = unloaded - started;
+        if (reloaded - unloaded < reload_best) reload_best = reloaded - unloaded;
+    }
+    if (rotation_ok)
+        printf("rotation S=%u: unload %.0f ms + reload %.0f ms, "
+               "3 cycles bit-identical PASS\n",
+               timing_rows, unload_best * 1e3, reload_best * 1e3);
+    free(pinned);
     h3_ane_block_free(block);
     h3_weight_store_free(store);
-    return pass ? 0 : 1;
+    return pass && rotation_ok ? 0 : 1;
 }
