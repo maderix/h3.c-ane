@@ -1,16 +1,12 @@
 #import "h3_ane_block.h"
-#import "h3_ane_linear.h"
+#import "h3_ane_bridge.h"
 #import "h3_convrot.h"
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
-#import <objc/message.h>
-#import <objc/runtime.h>
 
-#include <dlfcn.h>
 #include <math.h>
 #include <string.h>
-#include <time.h>
 
 enum {
     BLK_HIDDEN = 5376,
@@ -31,17 +27,13 @@ struct h3_ane_block {
     uint32_t rows;
     uint32_t padded_rows;
     uint64_t weight_bytes;
-    double compile_seconds;
-    bool cache_hit;
     IOSurfaceRef input_surface;
     IOSurfaceRef mod_surface;
     IOSurfaceRef output_surface;
     float *input_base;
     float *mod_base;
     float *output_base;
-    void *model;
-    void *request;
-    char *temporary_directory;
+    h3_ane_model *model;
 };
 
 static void blk_fail(char *error, size_t error_size, const char *format, ...) {
@@ -50,12 +42,6 @@ static void blk_fail(char *error, size_t error_size, const char *format, ...) {
     va_start(arguments, format);
     vsnprintf(error, error_size, format, arguments);
     va_end(arguments);
-}
-
-static double blk_seconds(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
 }
 
 /* Blob assembly: 64-byte file header, then 64-byte-aligned chunks. */
@@ -655,25 +641,16 @@ static NSString *blk_program(const blk_projection *qkv,
 
 /* --- runtime ------------------------------------------------------------- */
 
-static IOSurfaceRef blk_surface(size_t bytes) {
-    size_t aligned = (bytes + 16383u) & ~(size_t)16383u;
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(aligned),
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1,
-        (id)kIOSurfaceBytesPerRow: @(aligned),
-        (id)kIOSurfaceAllocSize: @(aligned),
-        (id)kIOSurfacePixelFormat: @0});
-}
-
 h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
                                   const char *prefix, uint32_t rows,
                                   const uint32_t *segment_ends,
                                   const float *rope_cos_values,
                                   const float *rope_sin_values,
                                   char *error, size_t error_size) {
-    dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/"
-           "AppleNeuralEngine", RTLD_NOW);
+    if (!h3_ane_bridge_available()) {
+        blk_fail(error, error_size, "the Neural Engine bridge is unavailable");
+        return NULL;
+    }
     if (!store || !prefix || !rows || !segment_ends || !rope_cos_values ||
         !rope_sin_values) {
         blk_fail(error, error_size, "invalid ANE block arguments");
@@ -767,198 +744,76 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
     block->padded_rows = padded;
     block->weight_bytes = blob.cursor;
 
+    size_t input_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
+    size_t output_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
+    const char *stage_env = getenv("H3_ANE_BLOCK_STAGE");
+    if (stage_env) {
+        int stage = atoi(stage_env);
+        uint32_t widest = BLK_HIDDEN;
+        if (stage == 3) widest = BLK_INNER * 3;
+        else if (stage == 4 || stage == 5) widest = BLK_INNER;
+        else if (stage == 6) widest = BLK_INNER;
+        else if (stage == 9) widest = BLK_FFN;
+        output_bytes = (size_t)widest * padded * sizeof(float);
+    }
+    size_t mod_bytes = (size_t)BLK_HIDDEN * H3_ANE_BLOCK_MOD_WIDTH *
+                       sizeof(float);
+    block->input_surface = h3_ane_bridge_surface(input_bytes);
+    block->mod_surface = h3_ane_bridge_surface(mod_bytes);
+    block->output_surface = h3_ane_bridge_surface(output_bytes);
+    if (!block->input_surface || !block->mod_surface ||
+        !block->output_surface) {
+        blk_fail(error, error_size, "ANE block surfaces failed");
+        free(blob.data);
+        h3_ane_block_free(block);
+        return NULL;
+    }
+    block->input_base = IOSurfaceGetBaseAddress(block->input_surface);
+    block->mod_base = IOSurfaceGetBaseAddress(block->mod_surface);
+    block->output_base = IOSurfaceGetBaseAddress(block->output_surface);
+    memset(block->input_base, 0, input_bytes);
+    for (uint32_t channel = 0; channel < BLK_HIDDEN; channel++)
+        for (uint32_t row = rows; row < padded; row++)
+            block->input_base[(size_t)channel * padded + row] = 1.0f;
+    memset(block->mod_base, 0, mod_bytes);
     @autoreleasepool {
-        NSError *failure = nil;
-        NSData *weights = [NSData dataWithBytesNoCopy:blob.data
-                                               length:blob.cursor
-                                         freeWhenDone:YES];
         NSString *source = blk_program(&qkv, &out, &fc1, &fc2, norm1, norm2,
                                        q_norm, k_norm, rope_header_cos,
                                        rope_header_sin, mask_header,
                                        padded != rows, ends,
                                        H3_ANE_BLOCK_SEGMENTS, padded);
-        NSData *program = [source dataUsingEncoding:NSUTF8StringEncoding];
-        Class descriptorClass = NSClassFromString(@"_ANEInMemoryModelDescriptor");
-        Class modelClass = NSClassFromString(@"_ANEInMemoryModel");
-        Class requestClass = NSClassFromString(@"_ANERequest");
-        Class surfaceClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        id descriptor = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
-            descriptorClass, @selector(modelWithMILText:weights:optionsPlist:),
-            program, @{@"@model_path/weights/weight.bin":
-                       @{@"offset": @0, @"data": weights}}, nil);
-        if (!descriptor) {
-            blk_fail(error, error_size, "ANE block descriptor rejected");
-            free(block);
-            return NULL;
-        }
-        id model = ((id(*)(Class, SEL, id))objc_msgSend)(
-            modelClass, @selector(inMemoryModelWithDescriptor:), descriptor);
-        NSString *identifier = ((id(*)(id, SEL))objc_msgSend)(
-            model, @selector(hexStringIdentifier));
-        NSString *directory = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:identifier];
-        bool cache = h3_ane_cache_enabled();
-        bool cached = cache &&
-            h3_ane_cache_restore((__bridge void *)identifier,
-                                 (__bridge void *)directory);
-        if (!cached)
-            h3_ane_cache_write_sources((__bridge void *)directory,
-                                       (__bridge void *)program,
-                                       (__bridge void *)weights);
-        block->temporary_directory = strdup(directory.UTF8String);
-        double started = blk_seconds();
-        bool loaded = cached &&
-            ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(loadWithQoS:options:error:), 21, @{},
-                &failure);
-        if (cached && !loaded) {
-            failure = nil;
-            h3_ane_cache_write_sources((__bridge void *)directory,
-                                       (__bridge void *)program,
-                                       (__bridge void *)weights);
-        }
-        if (!loaded) {
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(compileWithQoS:options:error:), 21, @{},
-                    &failure)) {
-                blk_fail(error, error_size, "ANE block compile failed: %s",
-                         failure ? failure.localizedDescription.UTF8String : "?");
-                h3_ane_block_free(block);
-                return NULL;
-            }
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(loadWithQoS:options:error:), 21, @{},
-                    &failure)) {
-                blk_fail(error, error_size, "ANE block load failed: %s",
-                         failure ? failure.localizedDescription.UTF8String : "?");
-                h3_ane_block_free(block);
-                return NULL;
-            }
-            if (cache)
-                h3_ane_cache_store((__bridge void *)identifier,
-                                   (__bridge void *)directory);
-        }
-        block->cache_hit = loaded;
-        block->compile_seconds = blk_seconds() - started;
-        size_t input_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
-        size_t output_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
-        const char *stage_env = getenv("H3_ANE_BLOCK_STAGE");
-        if (stage_env) {
-            int stage = atoi(stage_env);
-            uint32_t widest = BLK_HIDDEN;
-            if (stage == 3) widest = BLK_INNER * 3;
-            else if (stage == 4 || stage == 5) widest = BLK_INNER;
-            else if (stage == 6) widest = BLK_INNER;
-            else if (stage == 9) widest = BLK_FFN;
-            output_bytes = (size_t)widest * padded * sizeof(float);
-        }
-        size_t mod_bytes = (size_t)BLK_HIDDEN * H3_ANE_BLOCK_MOD_WIDTH *
-                           sizeof(float);
-        block->input_surface = blk_surface(input_bytes);
-        block->mod_surface = blk_surface(mod_bytes);
-        block->output_surface = blk_surface(output_bytes);
-        if (!block->input_surface || !block->mod_surface ||
-            !block->output_surface) {
-            blk_fail(error, error_size, "ANE block surfaces failed");
-            h3_ane_block_free(block);
-            return NULL;
-        }
-        block->input_base = IOSurfaceGetBaseAddress(block->input_surface);
-        block->mod_base = IOSurfaceGetBaseAddress(block->mod_surface);
-        block->output_base = IOSurfaceGetBaseAddress(block->output_surface);
-        memset(block->input_base, 0, input_bytes);
-        for (uint32_t channel = 0; channel < BLK_HIDDEN; channel++)
-            for (uint32_t row = rows; row < padded; row++)
-                block->input_base[(size_t)channel * padded + row] = 1.0f;
-        memset(block->mod_base, 0, mod_bytes);
-        id inputs = @[
-            ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-                surfaceClass, @selector(objectWithIOSurface:),
-                block->input_surface),
-            ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-                surfaceClass, @selector(objectWithIOSurface:),
-                block->mod_surface)];
-        id output = ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-            surfaceClass, @selector(objectWithIOSurface:),
-            block->output_surface);
-        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
-            requestClass,
-            @selector(requestWithInputs:inputIndices:outputs:outputIndices:
-                      weightsBuffer:perfStats:procedureIndex:),
-            inputs, @[@0, @1], @[output], @[@0], nil, nil, @0);
-        if (!request) {
-            blk_fail(error, error_size, "ANE block request rejected");
-            h3_ane_block_free(block);
-            return NULL;
-        }
-        block->model = (__bridge_retained void *)model;
-        block->request = (__bridge_retained void *)request;
+        IOSurfaceRef inputs[2] = {block->input_surface, block->mod_surface};
+        block->model = h3_ane_model_create("block", source.UTF8String,
+                                           blob.data, blob.cursor, inputs, 2,
+                                           block->output_surface,
+                                           error, error_size);
+    }
+    if (!block->model) {
+        h3_ane_block_free(block);
+        return NULL;
     }
     return block;
 }
 
 int h3_ane_block_unload(h3_ane_block *block, char *error, size_t error_size) {
-    if (!block || !block->model) {
+    if (!block) {
         blk_fail(error, error_size, "no ANE block model to unload");
         return 0;
     }
-    @autoreleasepool {
-        NSError *failure = nil;
-        if (!((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
-                (__bridge id)block->model, @selector(unloadWithQoS:error:), 21,
-                &failure)) {
-            blk_fail(error, error_size, "ANE block unload failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            return 0;
-        }
-    }
-    return 1;
+    return h3_ane_model_unload(block->model, error, error_size);
 }
 
 int h3_ane_block_reload(h3_ane_block *block, char *error, size_t error_size) {
-    if (!block || !block->model || !block->temporary_directory) {
+    if (!block) {
         blk_fail(error, error_size, "no ANE block model to reload");
         return 0;
     }
-    @autoreleasepool {
-        NSString *directory = @(block->temporary_directory);
-        h3_ane_cache_restore((__bridge void *)directory.lastPathComponent,
-                             (__bridge void *)directory);
-        NSError *failure = nil;
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                (__bridge id)block->model, @selector(loadWithQoS:options:error:),
-                21, @{}, &failure)) {
-            blk_fail(error, error_size, "ANE block reload failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            return 0;
-        }
-    }
-    return 1;
+    return h3_ane_model_reload(block->model, error, error_size);
 }
 
 void h3_ane_block_free(h3_ane_block *block) {
     if (!block) return;
-    @autoreleasepool {
-        if (block->model) {
-            id model = (__bridge_transfer id)block->model;
-            NSError *failure = nil;
-            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
-                model, @selector(unloadWithQoS:error:), 21, &failure);
-        }
-        if (block->request) {
-            id request = (__bridge_transfer id)block->request;
-            (void)request;
-        }
-        if (block->temporary_directory) {
-            [[NSFileManager defaultManager]
-                removeItemAtPath:@(block->temporary_directory) error:nil];
-            if (!h3_ane_cache_enabled())
-                h3_ane_cache_evict(strrchr(block->temporary_directory, '/') ?
-                    strrchr(block->temporary_directory, '/') + 1 :
-                    block->temporary_directory);
-            free(block->temporary_directory);
-        }
-    }
+    h3_ane_model_free(block->model);
     if (block->input_surface) CFRelease(block->input_surface);
     if (block->mod_surface) CFRelease(block->mod_surface);
     if (block->output_surface) CFRelease(block->output_surface);
@@ -982,11 +837,11 @@ uint32_t h3_ane_block_padded_rows(const h3_ane_block *block) {
 }
 
 double h3_ane_block_compile_seconds(const h3_ane_block *block) {
-    return block ? block->compile_seconds : 0.0;
+    return block ? h3_ane_model_compile_seconds(block->model) : 0.0;
 }
 
 bool h3_ane_block_cache_hit(const h3_ane_block *block) {
-    return block ? block->cache_hit : false;
+    return block ? h3_ane_model_cache_hit(block->model) : false;
 }
 
 uint64_t h3_ane_block_weight_bytes(const h3_ane_block *block) {
@@ -994,20 +849,9 @@ uint64_t h3_ane_block_weight_bytes(const h3_ane_block *block) {
 }
 
 int h3_ane_block_eval(h3_ane_block *block, char *error, size_t error_size) {
-    if (!block || !block->model || !block->request) {
+    if (!block) {
         blk_fail(error, error_size, "the ANE block is not loaded");
         return 0;
     }
-    int ok = 0;
-    @autoreleasepool {
-        NSError *failure = nil;
-        ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-            (__bridge id)block->model,
-            @selector(evaluateWithQoS:options:request:error:), 21, @{},
-            (__bridge id)block->request, &failure) ? 1 : 0;
-        if (!ok)
-            blk_fail(error, error_size, "ANE block evaluation failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-    }
-    return ok;
+    return h3_ane_model_eval(block->model, error, error_size);
 }

@@ -1,14 +1,12 @@
 #import "h3_ane_linear.h"
 
+#import "h3_ane_bridge.h"
 #import "h3_convrot.h"
 #import "h3_weights.h"
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
-#import <objc/message.h>
-#import <objc/runtime.h>
 
-#include <dlfcn.h>
 #include <string.h>
 #include <time.h>
 
@@ -29,15 +27,11 @@ struct h3_ane_linear {
     size_t input_bytes;
     size_t output_bytes;
     uint64_t weight_bytes;
-    double compile_seconds;
-    bool cache_hit;
     IOSurfaceRef input_surface[H3_ANE_MAX_CHUNKS];
     IOSurfaceRef output_surface;
     float *input_base[H3_ANE_MAX_CHUNKS];
     float *output_base;
-    void *model;
-    void *request;
-    char *temporary_directory;
+    h3_ane_model *model;
 };
 
 static void ane_fail(char *error, size_t error_size, const char *format, ...) {
@@ -54,100 +48,8 @@ static double ane_seconds(void) {
     return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
 }
 
-bool h3_ane_cache_enabled(void) {
-    const char *env = getenv("H3_ANE_CACHE");
-    return !env || atoi(env) != 0;
-}
-
-void h3_ane_cache_write_sources(void *dir, void *program, void *weights) {
-    NSString *directory = (__bridge NSString *)dir;
-    NSFileManager *files = [NSFileManager defaultManager];
-    [files createDirectoryAtPath:
-        [directory stringByAppendingPathComponent:@"weights"]
-        withIntermediateDirectories:YES attributes:nil error:nil];
-    [(__bridge NSData *)program writeToFile:
-        [directory stringByAppendingPathComponent:@"model.mil"] atomically:YES];
-    [(__bridge NSData *)weights writeToFile:
-        [directory stringByAppendingPathComponent:@"weights/weight.bin"]
-        atomically:YES];
-}
-
-static NSString *ane_cache_entry(NSString *identifier) {
-    return [[NSTemporaryDirectory()
-        stringByAppendingPathComponent:@"h3-ane-cache"]
-        stringByAppendingPathComponent:identifier];
-}
-
-/* Hardlink a directory tree (same volume, so links are free); copy as the
- * fallback. The destination is replaced. */
-static bool ane_mirror(NSString *from, NSString *to) {
-    NSFileManager *files = [NSFileManager defaultManager];
-    [files removeItemAtPath:to error:nil];
-    [files createDirectoryAtPath:[to stringByDeletingLastPathComponent]
-        withIntermediateDirectories:YES attributes:nil error:nil];
-    if ([files linkItemAtPath:from toPath:to error:nil]) return true;
-    [files removeItemAtPath:to error:nil];
-    return [files copyItemAtPath:from toPath:to error:nil];
-}
-
-/* The model unload deletes its staging directory, so compiled artifacts are
- * preserved in a content-addressed entry next to it and restored on reuse. */
-bool h3_ane_cache_restore(void *ident, void *dir) {
-    NSString *identifier = (__bridge NSString *)ident;
-    NSString *entry = ane_cache_entry(identifier);
-    NSFileManager *files = [NSFileManager defaultManager];
-    if (![files fileExistsAtPath:
-            [entry stringByAppendingPathComponent:@"compiled.ok"]])
-        return false;
-    NSString *directory = (__bridge NSString *)dir;
-    if (!ane_mirror(entry, directory)) return false;
-    [files removeItemAtPath:
-        [directory stringByAppendingPathComponent:@"compiled.ok"] error:nil];
-    return true;
-}
-
-/* Only the compiled artifacts are kept: `data` embeds the constants, so the
- * 381MB weights copy and the MIL text are dead weight in an entry. */
-void h3_ane_cache_store(void *ident, void *dir) {
-    NSString *identifier = (__bridge NSString *)ident;
-    NSString *directory = (__bridge NSString *)dir;
-    NSString *entry = ane_cache_entry(identifier);
-    NSFileManager *files = [NSFileManager defaultManager];
-    [files removeItemAtPath:entry error:nil];
-    if (![files createDirectoryAtPath:entry withIntermediateDirectories:YES
-                           attributes:nil error:nil]) return;
-    for (NSString *name in
-         [files contentsOfDirectoryAtPath:directory error:nil]) {
-        if ([name isEqualToString:@"weights"] ||
-            [name isEqualToString:@"model.mil"]) continue;
-        NSString *from = [directory stringByAppendingPathComponent:name];
-        NSString *to = [entry stringByAppendingPathComponent:name];
-        if (![files linkItemAtPath:from toPath:to error:nil]) {
-            [files removeItemAtPath:to error:nil];
-            if (![files copyItemAtPath:from toPath:to error:nil]) return;
-        }
-    }
-    [[NSData data] writeToFile:
-        [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
-}
-
-/* Freeing a model with the cache disabled also evicts its entry. */
-void h3_ane_cache_evict(const char *identifier) {
-    if (!identifier) return;
-    [[NSFileManager defaultManager]
-        removeItemAtPath:ane_cache_entry(@(identifier)) error:nil];
-}
-
 int h3_ane_linear_available(void) {
-    static int state = -1;
-    if (state >= 0) return state;
-    dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/"
-           "AppleNeuralEngine", RTLD_NOW);
-    state = NSClassFromString(@"_ANEInMemoryModelDescriptor") != nil &&
-            NSClassFromString(@"_ANEInMemoryModel") != nil &&
-            NSClassFromString(@"_ANERequest") != nil &&
-            NSClassFromString(@"_ANEIOSurfaceObject") != nil;
-    return state;
+    return h3_ane_bridge_available();
 }
 
 static NSString *ane_program(uint32_t chunk_dim, uint32_t output_dim,
@@ -414,17 +316,6 @@ static uint8_t *ane_weight_blob_int8(const int8_t *quantized,
     return blob;
 }
 
-static IOSurfaceRef ane_surface(size_t bytes) {
-    size_t aligned = (bytes + 16383u) & ~(size_t)16383u;
-    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
-        (id)kIOSurfaceWidth: @(aligned),
-        (id)kIOSurfaceHeight: @1,
-        (id)kIOSurfaceBytesPerElement: @1,
-        (id)kIOSurfaceBytesPerRow: @(aligned),
-        (id)kIOSurfaceAllocSize: @(aligned),
-        (id)kIOSurfacePixelFormat: @0});
-}
-
 typedef struct {
     uint32_t group_size;
     unsigned long tile_stride;
@@ -457,10 +348,27 @@ static h3_ane_linear *ane_build(const char *name, uint8_t *blob,
         sizeof(float);
     linear->weight_bytes = blob_bytes;
 
+    for (uint32_t c = 0; c < chunks; c++) {
+        linear->input_surface[c] = h3_ane_bridge_surface(linear->input_bytes);
+        if (!linear->input_surface[c]) {
+            ane_fail(error, error_size, "ANE %s input surface failed", name);
+            free(blob);
+            h3_ane_linear_free(linear);
+            return NULL;
+        }
+        linear->input_base[c] =
+            IOSurfaceGetBaseAddress(linear->input_surface[c]);
+        memset(linear->input_base[c], 0, linear->input_bytes);
+    }
+    linear->output_surface = h3_ane_bridge_surface(linear->output_bytes);
+    if (!linear->output_surface) {
+        ane_fail(error, error_size, "ANE %s output surface failed", name);
+        free(blob);
+        h3_ane_linear_free(linear);
+        return NULL;
+    }
+    linear->output_base = IOSurfaceGetBaseAddress(linear->output_surface);
     @autoreleasepool {
-        NSError *failure = nil;
-        NSData *weights = [NSData dataWithBytesNoCopy:blob length:blob_bytes
-                                         freeWhenDone:YES];
         NSString *text = int8_layout ?
             ane_program_int8(chunk_dim, output_dim, chunks,
                              linear->plane_rows, int8_layout->group_size,
@@ -468,124 +376,14 @@ static h3_ane_linear *ane_build(const char *name, uint8_t *blob,
                              int8_layout->scale_offset,
                              int8_layout->rotation_offset) :
             ane_program(chunk_dim, output_dim, chunks, linear->plane_rows);
-        NSData *program = [text dataUsingEncoding:NSUTF8StringEncoding];
-        Class descriptorClass = NSClassFromString(@"_ANEInMemoryModelDescriptor");
-        Class modelClass = NSClassFromString(@"_ANEInMemoryModel");
-        Class requestClass = NSClassFromString(@"_ANERequest");
-        Class surfaceClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        id descriptor = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
-            descriptorClass, @selector(modelWithMILText:weights:optionsPlist:),
-            program, @{@"@model_path/weights/weight.bin":
-                       @{@"offset": @0, @"data": weights}}, nil);
-        if (!descriptor) {
-            ane_fail(error, error_size, "ANE %s descriptor rejected", name);
-            free(linear);
-            return NULL;
-        }
-        id model = ((id(*)(Class, SEL, id))objc_msgSend)(
-            modelClass, @selector(inMemoryModelWithDescriptor:), descriptor);
-        if (!model) {
-            ane_fail(error, error_size, "ANE %s model rejected", name);
-            free(linear);
-            return NULL;
-        }
-        NSString *identifier = ((id(*)(id, SEL))objc_msgSend)(
-            model, @selector(hexStringIdentifier));
-        NSString *directory = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:identifier];
-        NSFileManager *files = [NSFileManager defaultManager];
-        bool cache = h3_ane_cache_enabled();
-        bool cached = cache &&
-            h3_ane_cache_restore((__bridge void *)identifier,
-                                 (__bridge void *)directory);
-        if (getenv("H3_ANE_CACHE_DEBUG"))
-            fprintf(stderr, "cache-debug %s id=%s cached=%d\n", name,
-                    identifier.UTF8String, cached);
-        if (!cached)
-            h3_ane_cache_write_sources((__bridge void *)directory,
-                                       (__bridge void *)program,
-                                       (__bridge void *)weights);
-        linear->temporary_directory = strdup(directory.UTF8String);
-        double started = ane_seconds();
-        bool loaded = cached &&
-            ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(loadWithQoS:options:error:), 21, @{},
-                &failure);
-        if (cached && !loaded) {
-            failure = nil;
-            h3_ane_cache_write_sources((__bridge void *)directory,
-                                       (__bridge void *)program,
-                                       (__bridge void *)weights);
-        }
-        if (!loaded) {
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(compileWithQoS:options:error:), 21, @{},
-                    &failure)) {
-                ane_fail(error, error_size, "ANE %s compile failed: %s", name,
-                         failure ? failure.localizedDescription.UTF8String : "?");
-                [files removeItemAtPath:directory error:nil];
-                free(linear->temporary_directory);
-                free(linear);
-                return NULL;
-            }
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(loadWithQoS:options:error:), 21, @{},
-                    &failure)) {
-                ane_fail(error, error_size, "ANE %s load failed: %s", name,
-                         failure ? failure.localizedDescription.UTF8String : "?");
-                [files removeItemAtPath:directory error:nil];
-                free(linear->temporary_directory);
-                free(linear);
-                return NULL;
-            }
-            if (cache)
-                h3_ane_cache_store((__bridge void *)identifier,
-                                   (__bridge void *)directory);
-        }
-        linear->cache_hit = loaded;
-        linear->compile_seconds = ane_seconds() - started;
-        NSMutableArray *inputs = [NSMutableArray array];
-        NSMutableArray *indices = [NSMutableArray array];
-        for (uint32_t c = 0; c < chunks; c++) {
-            linear->input_surface[c] = ane_surface(linear->input_bytes);
-            if (!linear->input_surface[c]) {
-                ane_fail(error, error_size, "ANE %s input surface failed", name);
-                free(linear->temporary_directory);
-                free(linear);
-                return NULL;
-            }
-            linear->input_base[c] =
-                IOSurfaceGetBaseAddress(linear->input_surface[c]);
-            memset(linear->input_base[c], 0, linear->input_bytes);
-            [inputs addObject:((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-                surfaceClass, @selector(objectWithIOSurface:),
-                linear->input_surface[c])];
-            [indices addObject:@(c)];
-        }
-        linear->output_surface = ane_surface(linear->output_bytes);
-        if (!linear->output_surface) {
-            ane_fail(error, error_size, "ANE %s output surface failed", name);
-            free(linear->temporary_directory);
-            free(linear);
-            return NULL;
-        }
-        linear->output_base = IOSurfaceGetBaseAddress(linear->output_surface);
-        id output = ((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(
-            surfaceClass, @selector(objectWithIOSurface:),
-            linear->output_surface);
-        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
-            requestClass,
-            @selector(requestWithInputs:inputIndices:outputs:outputIndices:
-                      weightsBuffer:perfStats:procedureIndex:),
-            inputs, indices, @[output], @[@0], nil, nil, @0);
-        if (!request) {
-            ane_fail(error, error_size, "ANE %s request rejected", name);
-            free(linear->temporary_directory);
-            free(linear);
-            return NULL;
-        }
-        linear->model = (__bridge_retained void *)model;
-        linear->request = (__bridge_retained void *)request;
+        linear->model = h3_ane_model_create(name, text.UTF8String, blob,
+                                            blob_bytes, linear->input_surface,
+                                            chunks, linear->output_surface,
+                                            error, error_size);
+    }
+    if (!linear->model) {
+        h3_ane_linear_free(linear);
+        return NULL;
     }
     return linear;
 }
@@ -698,29 +496,7 @@ h3_ane_linear *h3_ane_linear_create_chunked(const char *name,
 
 void h3_ane_linear_free(h3_ane_linear *linear) {
     if (!linear) return;
-    @autoreleasepool {
-        if (linear->model) {
-            id model = (__bridge_transfer id)linear->model;
-            NSError *failure = nil;
-            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
-                model, @selector(unloadWithQoS:error:), 21, &failure);
-            linear->model = NULL;
-        }
-        if (linear->request) {
-            id request = (__bridge_transfer id)linear->request;
-            (void)request;
-            linear->request = NULL;
-        }
-        if (linear->temporary_directory) {
-            [[NSFileManager defaultManager]
-                removeItemAtPath:@(linear->temporary_directory) error:nil];
-            if (!h3_ane_cache_enabled())
-                h3_ane_cache_evict(strrchr(linear->temporary_directory, '/') ?
-                    strrchr(linear->temporary_directory, '/') + 1 :
-                    linear->temporary_directory);
-            free(linear->temporary_directory);
-        }
-    }
+    h3_ane_model_free(linear->model);
     for (uint32_t c = 0; c < linear->chunks; c++)
         if (linear->input_surface[c]) CFRelease(linear->input_surface[c]);
     if (linear->output_surface) CFRelease(linear->output_surface);
@@ -765,11 +541,11 @@ size_t h3_ane_linear_output_bytes(const h3_ane_linear *linear) {
 }
 
 double h3_ane_linear_compile_seconds(const h3_ane_linear *linear) {
-    return linear ? linear->compile_seconds : 0.0;
+    return linear ? h3_ane_model_compile_seconds(linear->model) : 0.0;
 }
 
 bool h3_ane_linear_cache_hit(const h3_ane_linear *linear) {
-    return linear ? linear->cache_hit : false;
+    return linear ? h3_ane_model_cache_hit(linear->model) : false;
 }
 
 uint64_t h3_ane_linear_weight_bytes(const h3_ane_linear *linear) {
@@ -777,23 +553,11 @@ uint64_t h3_ane_linear_weight_bytes(const h3_ane_linear *linear) {
 }
 
 int h3_ane_linear_eval(h3_ane_linear *linear, char *error, size_t error_size) {
-    if (!linear || !linear->model || !linear->request) {
+    if (!linear) {
         ane_fail(error, error_size, "the ANE projection is not loaded");
         return 0;
     }
-    int ok = 0;
-    @autoreleasepool {
-        NSError *failure = nil;
-        id model = (__bridge id)linear->model;
-        id request = (__bridge id)linear->request;
-        ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-            model, @selector(evaluateWithQoS:options:request:error:), 21, @{},
-            request, &failure) ? 1 : 0;
-        if (!ok)
-            ane_fail(error, error_size, "ANE evaluation failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-    }
-    return ok;
+    return h3_ane_model_eval(linear->model, error, error_size);
 }
 
 struct h3_ane_projection {

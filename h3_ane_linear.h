@@ -70,18 +70,6 @@ double h3_ane_linear_compile_seconds(const h3_ane_linear *linear);
 uint64_t h3_ane_linear_weight_bytes(const h3_ane_linear *linear);
 bool h3_ane_linear_cache_hit(const h3_ane_linear *linear);
 
-/* Compiled-model reuse across runs, keyed by the content hash the Neural
- * Engine derives from the MIL text plus weights (a separate hash component
- * covers the weights, so same-shape different-weight models never collide).
- * The model unload deletes its staging directory, so artifacts persist in
- * $TMPDIR/h3-ane-cache/<identifier> via hardlinks. H3_ANE_CACHE=0 disables
- * reuse, and freeing a model while disabled also evicts its entry. */
-bool h3_ane_cache_enabled(void);
-void h3_ane_cache_write_sources(void *directory, void *program, void *weights);
-bool h3_ane_cache_restore(void *identifier, void *directory);
-void h3_ane_cache_store(void *identifier, void *directory);
-void h3_ane_cache_evict(const char *identifier);
-
 /* One spliced DiT projection: the ANE graph plus the Metal staging that moves
  * activations between h3.c's row-major BF16 rows and the channel-major F32
  * planes the Neural Engine reads. */
