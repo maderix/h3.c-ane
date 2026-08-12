@@ -45,7 +45,7 @@ bool h3_ane_model_cache_hit(const h3_ane_model *model);
 
 /* Compiled models persist in $TMPDIR/h3-ane-cache/<content-hash> (the hash
  * covers the MIL text AND the weights, so same-shape different-weight models
- * never collide). Only the compiled artifacts are kept — the `data` file
+ * never collide). Only the compiled artifacts are kept; the `data` file
  * embeds the constants. H3_ANE_CACHE=0 disables reuse, and freeing a model
  * while disabled also evicts its entry. */
 bool h3_ane_cache_enabled(void);
