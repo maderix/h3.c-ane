@@ -21,7 +21,10 @@ enum {
     BLK_ROPE_HALF = 48,
     BLK_ROPE_DIMS = BLK_ROPE_HALF * 2,
     BLK_GROUP = 256,
-    BLK_ROW_MULTIPLE = 16
+    BLK_ROW_MULTIPLE = 16,
+    /* Query rows per attention tile: caps the scores scratch at
+     * [1,56,512,rows] instead of [1,56,rows,rows]. */
+    BLK_ATTN_TILE = 512
 };
 
 struct h3_ane_block {
@@ -536,25 +539,66 @@ static NSString *blk_program(const blk_projection *qkv,
           "val=fp16(%f)];\n", 1.0 / sqrt((double)BLK_HEAD_DIM));
     EMIT(@"        tensor<int32, [4]> flat_sh = const()[name=string(\"flat_sh\"), "
           "val=tensor<int32, [4]>([1,%u,1,%u])];\n", BLK_INNER, rows);
-    EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc1 = matmul(transpose_x=bF, "
-          "transpose_y=bT, x=qr, y=kr)[name=string(\"sc1\")];\n",
-         BLK_HEADS, rows, rows);
-    EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc2 = mul(x=sc1, y=att_scale)"
-          "[name=string(\"sc2\")];\n", BLK_HEADS, rows, rows);
-    const char *scored = "sc2";
     if (masked) {
         char mask_shape[64];
         snprintf(mask_shape, sizeof(mask_shape), "[1,1,1,%u]", rows);
         emit_const_blob(text, "pad_mask", "fp16", mask_shape, pad_mask);
-        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc3 = add(x=sc2, y=pad_mask)"
-              "[name=string(\"sc3\")];\n", BLK_HEADS, rows, rows);
-        scored = "sc3";
     }
-    EMIT(@"        tensor<fp16, [1,%u,%u,%u]> probs = softmax(axis=sm_axis, "
-          "x=%s)[name=string(\"probs\")];\n", BLK_HEADS, rows, rows, scored);
-    EMIT(@"        tensor<fp16, [1,%u,%u,%u]> att = matmul(transpose_x=bF, "
-          "transpose_y=bF, x=probs, y=vh)[name=string(\"att\")];\n",
-         BLK_HEADS, rows, BLK_HEAD_DIM);
+    uint32_t tiles = (rows + BLK_ATTN_TILE - 1) / BLK_ATTN_TILE;
+    NSMutableString *att_parts = [NSMutableString string];
+    if (tiles > 1)
+        [text appendString:@"        int32 qt_axis = const()"
+            "[name=string(\"qt_axis\"), val=int32(2)];\n"];
+    for (uint32_t t = 0; t < tiles; t++) {
+        uint32_t r0 = t * BLK_ATTN_TILE;
+        uint32_t tr = rows - r0 < BLK_ATTN_TILE ? rows - r0 : BLK_ATTN_TILE;
+        char sfx[8] = "";
+        if (tiles > 1) snprintf(sfx, sizeof(sfx), "_%u", t);
+        const char *query = "qr";
+        char q_tile[16];
+        if (tiles > 1) {
+            EMIT(@"        tensor<int32, [4]> qt_b%u = const()"
+                  "[name=string(\"qt_b%u\"), "
+                  "val=tensor<int32, [4]>([0,0,%u,0])];\n", t, t, r0);
+            EMIT(@"        tensor<int32, [4]> qt_s%u = const()"
+                  "[name=string(\"qt_s%u\"), "
+                  "val=tensor<int32, [4]>([1,%u,%u,%u])];\n",
+                 t, t, BLK_HEADS, tr, BLK_HEAD_DIM);
+            EMIT(@"        tensor<fp16, [1,%u,%u,%u]> qt%u = "
+                  "slice_by_size(x=qr, begin=qt_b%u, size=qt_s%u)"
+                  "[name=string(\"qt%u\")];\n",
+                 BLK_HEADS, tr, BLK_HEAD_DIM, t, t, t, t);
+            snprintf(q_tile, sizeof(q_tile), "qt%u", t);
+            query = q_tile;
+        }
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc1%s = matmul("
+              "transpose_x=bF, transpose_y=bT, x=%s, y=kr)"
+              "[name=string(\"sc1%s\")];\n",
+             BLK_HEADS, tr, rows, sfx, query, sfx);
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc2%s = mul(x=sc1%s, "
+              "y=att_scale)[name=string(\"sc2%s\")];\n",
+             BLK_HEADS, tr, rows, sfx, sfx, sfx);
+        char scored[16];
+        snprintf(scored, sizeof(scored), "sc2%s", sfx);
+        if (masked) {
+            EMIT(@"        tensor<fp16, [1,%u,%u,%u]> sc3%s = add(x=sc2%s, "
+                  "y=pad_mask)[name=string(\"sc3%s\")];\n",
+                 BLK_HEADS, tr, rows, sfx, sfx, sfx);
+            snprintf(scored, sizeof(scored), "sc3%s", sfx);
+        }
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> probs%s = softmax("
+              "axis=sm_axis, x=%s)[name=string(\"probs%s\")];\n",
+             BLK_HEADS, tr, rows, sfx, scored, sfx);
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> att%s = matmul("
+              "transpose_x=bF, transpose_y=bF, x=probs%s, y=vh)"
+              "[name=string(\"att%s\")];\n",
+             BLK_HEADS, tr, BLK_HEAD_DIM, sfx, sfx, sfx);
+        [att_parts appendFormat:@"%satt%s", t ? "," : "", sfx];
+    }
+    if (tiles > 1)
+        EMIT(@"        tensor<fp16, [1,%u,%u,%u]> att = concat(axis=qt_axis, "
+              "interleave=noil, values=(%@))[name=string(\"att\")];\n",
+             BLK_HEADS, rows, BLK_HEAD_DIM, att_parts);
     EMIT(@"        tensor<fp16, [1,%u,%u,%u]> att_t = transpose(perm=pm, "
           "x=att)[name=string(\"att_t\")];\n", BLK_HEADS, BLK_HEAD_DIM, rows);
     EMIT(@"        tensor<fp16, [1,%u,1,%u]> att_f = reshape(shape=flat_sh, "
