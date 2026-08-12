@@ -1,5 +1,7 @@
 # h3.c-ane
 
+Making a tiny base-model Mac mini run a 19-billion-parameter video model has distinct David and Goliath energy, except David is a small aluminum box and nobody asked for its consent. The Neural Engine was handed 21GB of weights and a problem several sizes above its pay grade. It ran them anyway, presumably because Apple did not include a union.
+
 MiniMax-H3 video generation on the Apple Neural Engine. This fork of
 [antirez's h3.c](https://github.com/antirez/h3.c) runs every transformer block
 of the H3 DiT on the ANE in a base 24GB M4 Mac mini. The 50 blocks contain
