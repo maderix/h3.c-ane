@@ -1,15 +1,17 @@
 # h3.c-ane
 
-Making a tiny base-model Mac mini run a 19-billion-parameter video model has distinct David and Goliath energy, except David is a small aluminum box and nobody asked for its consent. The Neural Engine was handed 21GB of weights and a problem several sizes above its pay grade. It ran them anyway, presumably because Apple did not include a union.
+When I saw the [antirez's Minimax h3 video generation implementation](https://github.com/antirez/h3.c) on Metal, I thought
+-" what better way to toruture my tiny M4 ANE chip!" and obviously we couldn't go via the
+Apple approved coreML method
+![torture](assets/h3_ane_torture_scene.gif)
 
-MiniMax-H3 video generation on the Apple Neural Engine. This fork of
-[antirez's h3.c](https://github.com/antirez/h3.c) runs every transformer block
+So with Claude we set out to run every transformer block
 of the H3 DiT on the ANE in a base 24GB M4 Mac mini. The 50 blocks contain
 about 19 billion parameters (a 21GB int8 checkpoint). The machine cannot hold
 the entire model in memory, and the ANE was not designed to run a model this
 large. The implementation streams weights from SSD, rotates compiled ANE
 models through a small residency window, and uses the Metal GPU only to pack
-tensors in and out and decode the final video.
+tensors in and out and decode the final video. If anyone wants to send me a M5 Max to test this, I'm game :)
 
 ![hero](assets/h3_ane_hero.gif)
 
@@ -17,10 +19,6 @@ tensors in and out and decode the final video.
 "a hummingbird hovering over a flower". End-to-end generation takes about
 8.5 minutes (DiT 370s, VAE 88s), and the process peaks at 2.1GB of RAM.
 
-![torture](assets/h3_ane_torture_scene.gif)
-
-The obligatory self portrait, also generated on the Neural Engine (20
-denoise steps): the model depicting its own working conditions.
 
 ## Why
 
