@@ -287,6 +287,91 @@ int h3_weight_load_int8_raw(const h3_weight_store *store, const char *name,
     return 1;
 }
 
+int h3_weight_int8_stream_source(const h3_weight_store *store,
+                                 const char *name,
+                                 uint64_t rows, uint64_t columns,
+                                 const char **path, uint64_t *file_offset,
+                                 float **scales, int *convrot_group_size,
+                                 char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || tensor->dtype != H3_DTYPE_I8 || tensor->ndim != 2 ||
+        tensor->shape[0] != rows || tensor->shape[1] != columns) {
+        fail(error, error_size, "int8 stream weight %s is not I8 [%llu][%llu]",
+             name, (unsigned long long)rows, (unsigned long long)columns);
+        return 0;
+    }
+    int group_size = comfy_quant_group_size(store, name, error, error_size);
+    if (group_size < 0) return 0;
+    if (group_size && columns % (uint64_t)group_size) {
+        fail(error, error_size, "weight %s columns are not a convrot multiple",
+             name);
+        return 0;
+    }
+    float *row_scales = read_int8_scales(store, name, rows, error, error_size);
+    if (!row_scales) return 0;
+    *path = header->path;
+    *file_offset = tensor->file_offset;
+    *scales = row_scales;
+    *convrot_group_size = group_size;
+    return 1;
+}
+
+#define H3_INT8_STREAM_ROWS 2048
+
+int h3_weight_int8_stream_bf16(const char *path, uint64_t file_offset,
+                               size_t rows, size_t columns,
+                               const float *scales, int group_size,
+                               int (*emit)(void *opaque, size_t row_begin,
+                                           size_t row_count,
+                                           const uint16_t *values),
+                               void *opaque, char *error, size_t error_size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fail(error, error_size, "cannot open %s for int8 streaming", path);
+        return 0;
+    }
+    size_t slab_rows = rows < H3_INT8_STREAM_ROWS ? rows : H3_INT8_STREAM_ROWS;
+    int8_t *quantized = malloc(slab_rows * columns);
+    float *wide = malloc(sizeof(float) * slab_rows * columns);
+    uint16_t *narrow = malloc(sizeof(uint16_t) * slab_rows * columns);
+    int ok = quantized && wide && narrow;
+    if (!ok) fail(error, error_size, "out of memory streaming an int8 weight");
+    for (size_t begin = 0; ok && begin < rows; begin += slab_rows) {
+        size_t count = rows - begin < slab_rows ? rows - begin : slab_rows;
+        if (fseeko(file, (off_t)(file_offset + begin * columns), SEEK_SET) ||
+            fread(quantized, 1, count * columns, file) != count * columns) {
+            fail(error, error_size, "cannot read int8 rows from %s", path);
+            ok = 0;
+            break;
+        }
+        for (size_t row = 0; row < count; row++) {
+            float scale = scales[begin + row];
+            const int8_t *source = quantized + row * columns;
+            float *destination = wide + row * columns;
+            for (size_t column = 0; column < columns; column++)
+                destination[column] = (float)source[column] * scale;
+        }
+        if (group_size &&
+            !h3_convrot_derotate_f32(wide, count, columns, group_size)) {
+            fail(error, error_size, "cannot derotate streamed int8 rows");
+            ok = 0;
+            break;
+        }
+        for (size_t index = 0; index < count * columns; index++)
+            narrow[index] = bf16_from_f32(wide[index]);
+        if (!emit(opaque, begin, count, narrow)) {
+            fail(error, error_size, "int8 stream destination rejected rows");
+            ok = 0;
+        }
+    }
+    free(quantized);
+    free(wide);
+    free(narrow);
+    fclose(file);
+    return ok;
+}
+
 /* Dequantize (+ derotate) an int8_tensorwise projection to BF16. */
 static h3_gpu_tensor *load_int8_as_bf16(const h3_weight_store *store,
                                         h3_gpu *gpu, const char *name,
@@ -358,6 +443,33 @@ static h3_gpu_tensor *load_f16_as_bf16(const h3_st_header *header,
     return result;
 }
 
+static h3_gpu_tensor *load_f16_as_f32(const h3_st_header *header,
+                                      const h3_st_tensor *tensor,
+                                      h3_gpu *gpu, const char *name,
+                                      size_t elements,
+                                      char *error, size_t error_size) {
+    _Float16 *raw = malloc(sizeof(_Float16) * elements);
+    float *wide = malloc(sizeof(float) * elements);
+    h3_gpu_tensor *result = NULL;
+    char detail[384];
+    if (raw && wide &&
+        h3_st_read_data(header, tensor, raw, sizeof(_Float16) * elements,
+                        detail, sizeof(detail))) {
+        for (size_t index = 0; index < elements; index++)
+            wide[index] = (float)raw[index];
+        result = h3_gpu_tensor_from_f32(gpu, wide, elements);
+        if (!result)
+            fail(error, error_size, "cannot upload %s: %s", name,
+                 h3_gpu_error(gpu));
+    } else {
+        fail(error, error_size, "%s",
+             raw && wide ? detail : "out of memory widening an F16 weight");
+    }
+    free(raw);
+    free(wide);
+    return result;
+}
+
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape, h3_dtype dtype,
@@ -368,9 +480,10 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "required weight is absent: %s", name);
         return NULL;
     }
-    int converts = dtype == H3_DTYPE_BF16 &&
-        (tensor->dtype == H3_DTYPE_F16 ||
-         (tensor->dtype == H3_DTYPE_I8 && ndim == 2));
+    int converts = (dtype == H3_DTYPE_BF16 &&
+                    (tensor->dtype == H3_DTYPE_F16 ||
+                     (tensor->dtype == H3_DTYPE_I8 && ndim == 2))) ||
+                   (dtype == H3_DTYPE_F32 && tensor->dtype == H3_DTYPE_F16);
     if ((tensor->dtype != dtype && !converts) || tensor->ndim != ndim) {
         fail(error, error_size, "weight %s has dtype/rank %s/%d, expected %s/%d",
              name, h3_dtype_name(tensor->dtype), tensor->ndim,
@@ -397,9 +510,12 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
     if (tensor->dtype == H3_DTYPE_I8)
         return load_int8_as_bf16(store, gpu, name, shape[0], shape[1],
                                  error, error_size);
-    if (tensor->dtype == H3_DTYPE_F16 && dtype == H3_DTYPE_BF16)
-        return load_f16_as_bf16(header, tensor, gpu, name, (size_t)elements,
-                                error, error_size);
+    if (tensor->dtype == H3_DTYPE_F16)
+        return dtype == H3_DTYPE_BF16 ?
+            load_f16_as_bf16(header, tensor, gpu, name, (size_t)elements,
+                             error, error_size) :
+            load_f16_as_f32(header, tensor, gpu, name, (size_t)elements,
+                            error, error_size);
     h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
         h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
                                 (size_t)elements) :

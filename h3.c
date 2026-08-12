@@ -421,9 +421,12 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         free(ctx);
         return NULL;
     }
+    /* The text encoder may be absent when H3_CONDITIONING_FILE supplies
+     * precomputed embeddings; encoding then fails at the point of use. */
+    if (!h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder))
+        memset(&ctx->model.text_encoder, 0, sizeof(ctx->model.text_encoder));
     if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
         !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
         !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
@@ -969,7 +972,22 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
-    if (conditioning_hit) {
+    const char *conditioning_file = getenv("H3_CONDITIONING_FILE");
+    if (conditioning_file && *conditioning_file) {
+        if (ref2va || params->reference_count || params->first_frame ||
+            params->last_frame) {
+            h3_set_error(ctx, "H3_CONDITIONING_FILE supports text-only "
+                              "prompts; remove references and keyframes");
+            goto cleanup;
+        }
+        if (!h3_conditioning_file_read(conditioning_file, &text, detail,
+                                       sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: conditioning loaded from %s (%zu tokens)\n",
+                conditioning_file, text.tokens);
+    } else if (conditioning_hit) {
         size_t cached_reference_count = 0;
         if (!h3_conditioning_cache_load(
                 ctx, &text, &condition_video_rows, &condition_video_elements,

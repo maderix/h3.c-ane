@@ -833,3 +833,98 @@ int h3_text_encode_multimodal_layers_bf16(
         spans, span_count, position_ids, tags, layer_count,
         progress, progress_opaque, output, error, error_size);
 }
+
+#define H3_CONDITIONING_MAGIC UINT32_C(0x44434833) /* "H3CD" */
+#define H3_CONDITIONING_VERSION UINT32_C(1)
+#define H3_CONDITIONING_MAX_TOKENS UINT64_C(1048576)
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t tokens;
+    uint64_t width;
+    uint32_t has_tags;
+    uint32_t reserved;
+} h3_conditioning_header;
+
+int h3_conditioning_file_read(const char *path, h3_text_embedding *output,
+                              char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!path || !output) {
+        fail(error, error_size, "invalid conditioning file arguments");
+        return 0;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fail(error, error_size, "cannot open conditioning file: %s", path);
+        return 0;
+    }
+    h3_conditioning_header header;
+    if (fread(&header, sizeof(header), 1, file) != 1 ||
+        header.magic != H3_CONDITIONING_MAGIC ||
+        header.version != H3_CONDITIONING_VERSION) {
+        fail(error, error_size, "%s is not a version-%u H3CD conditioning file",
+             path, H3_CONDITIONING_VERSION);
+        fclose(file);
+        return 0;
+    }
+    if (!header.tokens || header.tokens > H3_CONDITIONING_MAX_TOKENS ||
+        header.width != H3_TEXT_HIDDEN_SIZE || header.has_tags > 1) {
+        fail(error, error_size,
+             "conditioning file %s has tokens=%llu width=%llu, expected "
+             "width %u", path, (unsigned long long)header.tokens,
+             (unsigned long long)header.width, H3_TEXT_HIDDEN_SIZE);
+        fclose(file);
+        return 0;
+    }
+    size_t elements = (size_t)header.tokens * (size_t)header.width;
+    output->values = malloc(elements * sizeof(*output->values));
+    if (header.has_tags)
+        output->tags = malloc((size_t)header.tokens * sizeof(*output->tags));
+    int ok = output->values && (!header.has_tags || output->tags) &&
+        fread(output->values, sizeof(*output->values), elements, file) ==
+            elements &&
+        (!header.has_tags ||
+         fread(output->tags, 1, (size_t)header.tokens, file) ==
+             (size_t)header.tokens);
+    fclose(file);
+    if (!ok) {
+        fail(error, error_size, "conditioning file %s is truncated", path);
+        h3_text_embedding_free(output);
+        return 0;
+    }
+    output->tokens = (size_t)header.tokens;
+    output->width = (size_t)header.width;
+    return 1;
+}
+
+int h3_conditioning_file_write(const char *path,
+                               const h3_text_embedding *embedding,
+                               char *error, size_t error_size) {
+    if (!path || !embedding || !embedding->tokens || !embedding->values ||
+        embedding->width != H3_TEXT_HIDDEN_SIZE ||
+        embedding->tokens > H3_CONDITIONING_MAX_TOKENS) {
+        fail(error, error_size, "invalid conditioning payload");
+        return 0;
+    }
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fail(error, error_size, "cannot create conditioning file: %s", path);
+        return 0;
+    }
+    h3_conditioning_header header = {
+        H3_CONDITIONING_MAGIC, H3_CONDITIONING_VERSION,
+        embedding->tokens, embedding->width,
+        embedding->tags ? 1u : 0u, 0
+    };
+    size_t elements = embedding->tokens * embedding->width;
+    int ok = fwrite(&header, sizeof(header), 1, file) == 1 &&
+        fwrite(embedding->values, sizeof(*embedding->values), elements,
+               file) == elements &&
+        (!embedding->tags ||
+         fwrite(embedding->tags, 1, embedding->tokens, file) ==
+             embedding->tokens);
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) fail(error, error_size, "cannot write conditioning file: %s", path);
+    return ok;
+}

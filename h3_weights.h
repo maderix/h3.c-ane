@@ -39,4 +39,24 @@ int h3_weight_load_int8_raw(const h3_weight_store *store, const char *name,
                             int *convrot_group_size,
                             char *error, size_t error_size);
 
+/* Resolve an int8_tensorwise projection for SSD streaming: the payload
+ * location plus the resident per-row scales (caller frees). The path aliases
+ * the store's header and stays valid while the store is open. */
+int h3_weight_int8_stream_source(const h3_weight_store *store,
+                                 const char *name,
+                                 uint64_t rows, uint64_t columns,
+                                 const char **path, uint64_t *file_offset,
+                                 float **scales, int *convrot_group_size,
+                                 char *error, size_t error_size);
+
+/* Stream an int8_tensorwise payload as dequantized+derotated BF16 row slabs.
+ * Safe on an I/O thread; emit returns 0 to abort. */
+int h3_weight_int8_stream_bf16(const char *path, uint64_t file_offset,
+                               size_t rows, size_t columns,
+                               const float *scales, int group_size,
+                               int (*emit)(void *opaque, size_t row_begin,
+                                           size_t row_count,
+                                           const uint16_t *values),
+                               void *opaque, char *error, size_t error_size);
+
 #endif

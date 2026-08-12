@@ -64,4 +64,15 @@ int h3_text_encode_multimodal_layers_bf16(
                         char *error, size_t error_size);
 void h3_text_embedding_free(h3_text_embedding *embedding);
 
+/* Precomputed-conditioning file: "H3CD" magic, u32 version 1, u64 tokens,
+ * u64 width, u32 has_tags, u32 reserved, BF16 values [tokens][width], then
+ * u8 tags [tokens] when present. Little-endian throughout. Lets a host with
+ * the 32B text encoder mint the conditioning that h3_generate consumes via
+ * H3_CONDITIONING_FILE. */
+int h3_conditioning_file_read(const char *path, h3_text_embedding *output,
+                              char *error, size_t error_size);
+int h3_conditioning_file_write(const char *path,
+                               const h3_text_embedding *embedding,
+                               char *error, size_t error_size);
+
 #endif

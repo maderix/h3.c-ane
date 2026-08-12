@@ -9,6 +9,7 @@
 
 #include "h3_convrot.h"
 #include "h3_gpu.h"
+#include "h3_text_encoder.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -107,6 +108,15 @@ static void derotate_gates(void) {
           "derotate rejects a non-multiple column count");
     free(original);
     free(rotated);
+}
+
+static size_t streamed_rows;
+static int stream_collect(void *opaque, size_t row_begin, size_t row_count,
+                          const uint16_t *values) {
+    memcpy((uint16_t *)opaque + row_begin * COLS, values,
+           row_count * COLS * sizeof(uint16_t));
+    streamed_rows += row_count;
+    return 1;
 }
 
 /* Minimal safetensors writer for the fixture. */
@@ -283,6 +293,44 @@ static void loader_gates(h3_gpu *gpu, const char *directory) {
     check(!tensor, "shape mismatch is rejected");
     h3_gpu_tensor_free(tensor);
 
+    /* SSD-streaming form of the same projection: source resolution plus
+     * slabbed dequant+derotate must agree with the double reference. */
+    {
+        const char *stream_path = NULL;
+        uint64_t stream_offset = 0;
+        float *stream_scales = NULL;
+        int stream_gs = 0;
+        check(h3_weight_int8_stream_source(store, "proj.weight", ROWS, COLS,
+                                           &stream_path, &stream_offset,
+                                           &stream_scales, &stream_gs, error,
+                                           sizeof(error)),
+              "int8 stream source resolves");
+        static uint16_t streamed[ROWS * COLS];
+        streamed_rows = 0;
+        check(stream_path &&
+              h3_weight_int8_stream_bf16(stream_path, stream_offset, ROWS,
+                                         COLS, stream_scales, stream_gs,
+                                         stream_collect, streamed, error,
+                                         sizeof(error)),
+              "int8 stream reads all slabs");
+        check(streamed_rows == ROWS, "int8 stream visits every row");
+        double worst = 0, peak = 0;
+        for (int r = 0; r < ROWS; r++)
+            for (int c = 0; c < COLS; c++) {
+                int g = c / GS, j = c % GS;
+                double expected = 0;
+                for (int i = 0; i < GS; i++)
+                    expected += (double)quantized[r][g*GS + i] *
+                                (double)scales[r] * (double)table[i*GS + j];
+                worst = fmax(worst, fabs(f32_from_bf16(streamed[r*COLS + c]) -
+                                         expected));
+                peak = fmax(peak, fabs(expected));
+            }
+        check(worst <= peak * 0.02,
+              "streamed rows match the double reference");
+        free(stream_scales);
+    }
+
     /* BF16 fast path is unchanged; F16 converts. */
     uint64_t plain_shape[] = {4, 8};
     tensor = h3_weight_load_bf16(store, gpu, "plain.weight", 2, plain_shape,
@@ -307,8 +355,54 @@ static void loader_gates(h3_gpu *gpu, const char *directory) {
         check(exact, "F16 conversion rounds to nearest-even BF16");
         h3_gpu_tensor_free(tensor);
     }
+    tensor = h3_weight_load_f32(store, gpu, "half.weight", 1, half_shape,
+                                error, sizeof(error));
+    check(tensor != NULL, "F16 weight loads as F32");
+    if (tensor) {
+        float loaded[16];
+        h3_gpu_tensor_read_f32(tensor, loaded, 16);
+        int exact = 1;
+        for (int i = 0; i < 16; i++)
+            if (loaded[i] != (float)half[i]) exact = 0;
+        check(exact, "F16 to F32 widening is exact");
+        h3_gpu_tensor_free(tensor);
+    }
 
     h3_weight_store_free(store);
+    unlink(path);
+}
+
+static void conditioning_gates(const char *directory) {
+    char error[512] = {0};
+    enum { TOKENS = 3 };
+    static uint16_t values[TOKENS * H3_TEXT_HIDDEN_SIZE];
+    static uint8_t tags[TOKENS] = {1, 0, 1};
+    for (size_t i = 0; i < TOKENS * H3_TEXT_HIDDEN_SIZE; i++)
+        values[i] = (uint16_t)(0x3f80 + (i % 251));
+    h3_text_embedding source = {TOKENS, H3_TEXT_HIDDEN_SIZE, values, {0}, tags};
+    char path[512];
+    snprintf(path, sizeof(path), "%s/conditioning.h3cd", directory);
+    check(h3_conditioning_file_write(path, &source, error, sizeof(error)),
+          "conditioning file writes");
+    h3_text_embedding loaded = {0};
+    check(h3_conditioning_file_read(path, &loaded, error, sizeof(error)),
+          "conditioning file reads back");
+    check(loaded.tokens == TOKENS && loaded.width == H3_TEXT_HIDDEN_SIZE &&
+          loaded.values && loaded.tags &&
+          !memcmp(loaded.values, values, sizeof(values)) &&
+          !memcmp(loaded.tags, tags, sizeof(tags)),
+          "conditioning round-trip is exact");
+    h3_text_embedding_free(&loaded);
+    /* A corrupt header must be rejected, not decoded. */
+    FILE *file = fopen(path, "r+b");
+    if (file) {
+        uint32_t bad = 0;
+        fwrite(&bad, sizeof(bad), 1, file);
+        fclose(file);
+    }
+    error[0] = '\0';
+    check(!h3_conditioning_file_read(path, &loaded, error, sizeof(error)) &&
+          strstr(error, "H3CD"), "corrupt conditioning file is rejected");
     unlink(path);
 }
 
@@ -374,6 +468,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     loader_gates(gpu, directory);
+    conditioning_gates(directory);
     rmdir(directory);
     if (argc > 1) real_checkpoint_gate(gpu, argv[1]);
     h3_gpu_free(gpu);

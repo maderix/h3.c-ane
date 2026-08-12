@@ -66,6 +66,12 @@ typedef struct {
     uint64_t file_offset;
     size_t elements;
     unsigned field;
+    /* int8_tensorwise sources dequantize+derotate on the I/O thread. */
+    size_t rows;
+    size_t columns;
+    float *scales;
+    int group_size;
+    int int8;
 } h3_dit_stream_source;
 
 typedef struct {
@@ -604,16 +610,31 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
-    if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+    if (!header || tensor->ndim != 2 ||
         tensor->shape[0] != rows || tensor->shape[1] != columns ||
         rows > SIZE_MAX / columns) {
         fail(error, error_size, "streaming weight has the wrong schema: %s",
              name);
         return 0;
     }
-    source->path = header->path;
-    source->file_offset = tensor->file_offset;
+    if (tensor->dtype == H3_DTYPE_I8) {
+        if (!h3_weight_int8_stream_source(
+                dit->weights, name, rows, columns, &source->path,
+                &source->file_offset, &source->scales, &source->group_size,
+                error, error_size))
+            return 0;
+        source->int8 = 1;
+    } else if (tensor->dtype == H3_DTYPE_BF16) {
+        source->path = header->path;
+        source->file_offset = tensor->file_offset;
+    } else {
+        fail(error, error_size, "streaming weight %s has dtype %s", name,
+             h3_dtype_name(tensor->dtype));
+        return 0;
+    }
     source->elements = (size_t)(rows * columns);
+    source->rows = (size_t)rows;
+    source->columns = (size_t)columns;
     source->field = field;
     return 1;
 }
@@ -675,6 +696,19 @@ typedef struct {
     char error[512];
 } h3_dit_stream_job;
 
+typedef struct {
+    h3_gpu_tensor *target;
+    size_t columns;
+} h3_dit_int8_stream_sink;
+
+static int stream_int8_emit(void *opaque, size_t row_begin, size_t row_count,
+                            const uint16_t *values) {
+    h3_dit_int8_stream_sink *sink = opaque;
+    return h3_gpu_tensor_write_bf16_range(
+        sink->target, row_begin * sink->columns, values,
+        row_count * sink->columns);
+}
+
 static int read_stream_layer(h3_dit_stream_job *job) {
     h3_dit_stream_layer *layer = &job->dit->stream_layers[job->layer];
     h3_dit_block *slot = &job->dit->stream_slots[job->slot];
@@ -685,16 +719,35 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     for (unsigned index = 0; index < STREAM_MATRICES; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
-                target, source->path, source->file_offset, source->elements,
-                job->error, sizeof(job->error))) {
-            if (!job->error[0])
-                snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
+        if (!target) {
+            snprintf(job->error, sizeof(job->error),
+                     "invalid BF16 streaming destination");
             job->ok = 0;
             break;
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        if (source->int8) {
+            h3_dit_int8_stream_sink sink = {target, source->columns};
+            if (!h3_weight_int8_stream_bf16(
+                    source->path, source->file_offset, source->rows,
+                    source->columns, source->scales, source->group_size,
+                    stream_int8_emit, &sink, job->error,
+                    sizeof(job->error))) {
+                job->ok = 0;
+                break;
+            }
+            job->bytes += (uint64_t)source->elements;
+        } else {
+            if (!h3_gpu_tensor_stream_file_bf16(
+                    target, source->path, source->file_offset,
+                    source->elements, job->error, sizeof(job->error))) {
+                if (!job->error[0])
+                    snprintf(job->error, sizeof(job->error),
+                             "invalid BF16 streaming destination");
+                job->ok = 0;
+                break;
+            }
+            job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        }
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -1335,6 +1388,7 @@ static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
         &block->qkv, &block->out, &block->fc1, &block->fc2
     };
     for (int entry = 0; entry < 4; entry++) {
+        if (!*dead_weights[entry]) continue;
         released_bytes += (uint64_t)h3_gpu_tensor_elements(
             *dead_weights[entry]) * sizeof(uint16_t);
         free_tensor(dead_weights[entry]);
@@ -1345,6 +1399,22 @@ static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
                 "h3: DiT block %u projections on the Neural Engine; "
                 "released %.1f MiB of dead BF16 weights\n",
                 index, (double)released_bytes / (1024.0 * 1024.0));
+    }
+    return 1;
+}
+
+/* All four projections stored int8: the ANE graphs read the raw payload, so
+ * the BF16 dequant never needs to materialize. */
+static int block_projections_int8(const h3_dit *dit, unsigned index) {
+    static const char *suffixes[4] = {
+        "attn.qkv_proj.weight", "attn.out_proj.weight",
+        "mlp.fc1.weight", "mlp.fc2.weight"
+    };
+    for (int entry = 0; entry < 4; entry++) {
+        char name[96];
+        snprintf(name, sizeof(name), "blocks.%u.%s", index, suffixes[entry]);
+        const h3_st_tensor *stored = h3_weight_find(dit->weights, name, NULL);
+        if (!stored || stored->dtype != H3_DTYPE_I8) return 0;
     }
     return 1;
 }
@@ -1364,6 +1434,13 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (dit->ane_linears &&
+                   dit->ane_block_count < dit->ane_block_limit &&
+                   block_projections_int8(dit, index)) {
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size) ||
+                !prepare_ane_block(dit, &dit->blocks[index], index,
+                                   error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -3154,6 +3231,9 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
         free_block(&dit->blocks[block]);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        for (unsigned index = 0; index < STREAM_MATRICES; index++)
+            free(dit->stream_layers[block].sources[index].scales);
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
     free_tensor(&dit->final_norm);
