@@ -1,4 +1,5 @@
 #import "h3_ane_block.h"
+#import "h3_ane_linear.h"
 #import "h3_convrot.h"
 
 #import <Foundation/Foundation.h>
@@ -28,6 +29,7 @@ struct h3_ane_block {
     uint32_t padded_rows;
     uint64_t weight_bytes;
     double compile_seconds;
+    bool cache_hit;
     IOSurfaceRef input_surface;
     IOSurfaceRef mod_surface;
     IOSurfaceRef output_surface;
@@ -751,33 +753,48 @@ h3_ane_block *h3_ane_block_create(const h3_weight_store *store,
             model, @selector(hexStringIdentifier));
         NSString *directory = [NSTemporaryDirectory()
             stringByAppendingPathComponent:identifier];
-        NSFileManager *files = [NSFileManager defaultManager];
-        [files createDirectoryAtPath:
-            [directory stringByAppendingPathComponent:@"weights"]
-            withIntermediateDirectories:YES attributes:nil error:nil];
-        [program writeToFile:[directory stringByAppendingPathComponent:
-            @"model.mil"] atomically:YES];
-        [weights writeToFile:[directory
-            stringByAppendingPathComponent:@"weights/weight.bin"]
-                  atomically:YES];
+        bool cache = h3_ane_cache_enabled();
+        bool cached = cache &&
+            h3_ane_cache_restore((__bridge void *)identifier,
+                                 (__bridge void *)directory);
+        if (!cached)
+            h3_ane_cache_write_sources((__bridge void *)directory,
+                                       (__bridge void *)program,
+                                       (__bridge void *)weights);
         block->temporary_directory = strdup(directory.UTF8String);
         double started = blk_seconds();
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(compileWithQoS:options:error:), 21, @{},
-                &failure)) {
-            blk_fail(error, error_size, "ANE block compile failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            h3_ane_block_free(block);
-            return NULL;
-        }
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        bool loaded = cached &&
+            ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
                 model, @selector(loadWithQoS:options:error:), 21, @{},
-                &failure)) {
-            blk_fail(error, error_size, "ANE block load failed: %s",
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            h3_ane_block_free(block);
-            return NULL;
+                &failure);
+        if (cached && !loaded) {
+            failure = nil;
+            h3_ane_cache_write_sources((__bridge void *)directory,
+                                       (__bridge void *)program,
+                                       (__bridge void *)weights);
         }
+        if (!loaded) {
+            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                    model, @selector(compileWithQoS:options:error:), 21, @{},
+                    &failure)) {
+                blk_fail(error, error_size, "ANE block compile failed: %s",
+                         failure ? failure.localizedDescription.UTF8String : "?");
+                h3_ane_block_free(block);
+                return NULL;
+            }
+            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                    model, @selector(loadWithQoS:options:error:), 21, @{},
+                    &failure)) {
+                blk_fail(error, error_size, "ANE block load failed: %s",
+                         failure ? failure.localizedDescription.UTF8String : "?");
+                h3_ane_block_free(block);
+                return NULL;
+            }
+            if (cache)
+                h3_ane_cache_store((__bridge void *)identifier,
+                                   (__bridge void *)directory);
+        }
+        block->cache_hit = loaded;
         block->compile_seconds = blk_seconds() - started;
         size_t input_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
         size_t output_bytes = (size_t)BLK_HIDDEN * padded * sizeof(float);
@@ -852,6 +869,10 @@ void h3_ane_block_free(h3_ane_block *block) {
         if (block->temporary_directory) {
             [[NSFileManager defaultManager]
                 removeItemAtPath:@(block->temporary_directory) error:nil];
+            if (!h3_ane_cache_enabled())
+                h3_ane_cache_evict(strrchr(block->temporary_directory, '/') ?
+                    strrchr(block->temporary_directory, '/') + 1 :
+                    block->temporary_directory);
             free(block->temporary_directory);
         }
     }
@@ -879,6 +900,10 @@ uint32_t h3_ane_block_padded_rows(const h3_ane_block *block) {
 
 double h3_ane_block_compile_seconds(const h3_ane_block *block) {
     return block ? block->compile_seconds : 0.0;
+}
+
+bool h3_ane_block_cache_hit(const h3_ane_block *block) {
+    return block ? block->cache_hit : false;
 }
 
 uint64_t h3_ane_block_weight_bytes(const h3_ane_block *block) {

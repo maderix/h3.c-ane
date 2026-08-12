@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static unsigned failures;
 
@@ -178,6 +179,98 @@ static void synthetic(const char *name, uint32_t input_dim,
     free(scales);
 }
 
+/* Load into a fresh linear, eval a fixed input, return the raw output copy. */
+static float *cache_run(const char *name, const int8_t *quantized,
+                        const float *scales, uint32_t input_dim,
+                        uint32_t output_dim, uint32_t rows, bool *hit,
+                        bool remove_dir, double *seconds) {
+    char error[256] = {0};
+    h3_ane_linear *linear = h3_ane_linear_create_int8(
+        name, quantized, scales, 256, input_dim, output_dim, rows,
+        input_dim / 2, error, sizeof(error));
+    if (!linear) {
+        printf("FAIL %s create: %s\n", name, error);
+        failures++;
+        return NULL;
+    }
+    *hit = h3_ane_linear_cache_hit(linear);
+    *seconds = h3_ane_linear_compile_seconds(linear);
+    uint32_t plane_rows = h3_ane_linear_plane_rows(linear);
+    uint32_t chunk_dim = h3_ane_linear_chunk_dim(linear);
+    for (uint32_t chunk = 0; chunk < h3_ane_linear_chunks(linear); chunk++) {
+        float *plane = h3_ane_linear_input(linear, chunk);
+        memset(plane, 0, h3_ane_linear_input_bytes(linear));
+        for (uint32_t j = 0; j < chunk_dim; j++) {
+            uint32_t k = chunk * chunk_dim + j;
+            if (k >= input_dim) break;
+            for (uint32_t s = 0; s < rows; s++)
+                plane[(size_t)j * plane_rows + s] =
+                    (float)((int)((k * 131 + s * 17) % 97) - 48) / 24.0f;
+        }
+    }
+    float *output = NULL;
+    if (!h3_ane_linear_eval(linear, error, sizeof(error))) {
+        printf("FAIL %s eval: %s\n", name, error);
+        failures++;
+    } else {
+        size_t bytes = h3_ane_linear_output_bytes(linear);
+        output = malloc(bytes);
+        memcpy(output, h3_ane_linear_output(linear), bytes);
+    }
+    if (remove_dir) setenv("H3_ANE_CACHE", "0", 1);
+    h3_ane_linear_free(linear);
+    if (remove_dir) setenv("H3_ANE_CACHE", "1", 1);
+    return output;
+}
+
+/* Compile-cache gates: a recreate must hit and reproduce the first run
+ * bit-exactly; same-shape different weights must MISS (the content hash
+ * covers the weights) and still match their own reference. */
+static void cache_gates(void) {
+    enum { K = 1024, N = 256, ROWS = 16 };
+    setenv("H3_ANE_CACHE", "1", 1);
+    int8_t *quantized = malloc((size_t)N * K);
+    float *scales = malloc(sizeof(float) * N);
+    uint32_t salt = (uint32_t)time(NULL);
+    for (size_t i = 0; i < (size_t)N * K; i++)
+        quantized[i] = (int8_t)(((i * 2654435761u + salt) >> 16) % 255 - 127);
+    for (uint32_t n = 0; n < N; n++) scales[n] = 0.01f + 1e-5f * (float)n;
+    /* The reference gate compiles fresh, passes numerics, and its cache-on
+     * free seeds the entry, so both recreates below must load from cache. */
+    gate("cache-shape", quantized, scales, 256, K, N, ROWS, K / 2);
+    bool hit1 = false, hit2 = false, hit3 = true, scratch = false;
+    double first = 0, second = 0, third = 0, ignored = 0;
+    float *a = cache_run("cache-a", quantized, scales, K, N, ROWS, &hit1,
+                         false, &first);
+    float *b = cache_run("cache-b", quantized, scales, K, N, ROWS, &hit2,
+                         false, &second);
+    float kept = scales[0];
+    scales[0] *= 2.0f;
+    float *c = cache_run("cache-c", quantized, scales, K, N, ROWS, &hit3,
+                         false, &third);
+    /* Cleanup loads: a cache-off free evicts each content entry. */
+    free(cache_run("cache-rm-c", quantized, scales, K, N, ROWS, &scratch,
+                   true, &ignored));
+    scales[0] = kept;
+    free(cache_run("cache-rm-a", quantized, scales, K, N, ROWS, &scratch,
+                   true, &ignored));
+    int bitexact = a && b &&
+        !memcmp(a, b, sizeof(float) * N * ((ROWS + 15) / 16 * 16));
+    /* c must differ from a: a collision would silently reuse a's model. */
+    int distinct = a && c && memcmp(a, c, sizeof(float) * N * ROWS) != 0;
+    int pass = a && b && c && hit1 && hit2 && !hit3 && bitexact && distinct;
+    printf("cache        hit=%.3fs rehit=%.3fs miss=%.3fs hits=%d/%d/%d "
+           "bitexact=%d distinct=%d %s\n",
+           first, second, third, hit1, hit2, hit3, bitexact, distinct,
+           pass ? "PASS" : "FAIL");
+    if (!pass) failures++;
+    free(a);
+    free(b);
+    free(c);
+    free(quantized);
+    free(scales);
+}
+
 int main(int argc, char **argv) {
     if (!h3_ane_linear_available()) {
         printf("skip: the Neural Engine bridge is unavailable\n");
@@ -187,6 +280,7 @@ int main(int argc, char **argv) {
      * rotated projection and an unrotated kc=2048 projection. */
     synthetic("rot-padded", 1280, 384, 32, 1024, 256);
     synthetic("plain-2048", 4096, 256, 64, 2048, 0);
+    cache_gates();
     if (argc > 1) {
         char error[512] = {0};
         h3_weight_store *store = h3_weight_store_open(argv[1], error,

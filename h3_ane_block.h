@@ -3,6 +3,7 @@
 
 #include "h3_weights.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -43,6 +44,7 @@ uint32_t h3_ane_block_padded_rows(const h3_ane_block *block);
 
 int h3_ane_block_eval(h3_ane_block *block, char *error, size_t error_size);
 double h3_ane_block_compile_seconds(const h3_ane_block *block);
+bool h3_ane_block_cache_hit(const h3_ane_block *block);
 uint64_t h3_ane_block_weight_bytes(const h3_ane_block *block);
 
 #endif

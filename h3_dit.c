@@ -1573,9 +1573,10 @@ static int prepare_full_ane_block(h3_dit *dit, h3_dit_block *block,
     }
     if (getenv("H3_PROFILE"))
         fprintf(stderr, "h3: DiT block %u fully on the Neural Engine "
-                "(%.1f MiB, compile %.2fs)\n", index,
+                "(%.1f MiB, %s %.2fs)\n", index,
                 (double)h3_ane_block_weight_bytes(block->full) /
                     (1024.0 * 1024.0),
+                h3_ane_block_cache_hit(block->full) ? "cached load" : "compile",
                 h3_ane_block_compile_seconds(block->full));
     return 1;
 }

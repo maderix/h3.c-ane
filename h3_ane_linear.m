@@ -30,6 +30,7 @@ struct h3_ane_linear {
     size_t output_bytes;
     uint64_t weight_bytes;
     double compile_seconds;
+    bool cache_hit;
     IOSurfaceRef input_surface[H3_ANE_MAX_CHUNKS];
     IOSurfaceRef output_surface;
     float *input_base[H3_ANE_MAX_CHUNKS];
@@ -51,6 +52,73 @@ static double ane_seconds(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+bool h3_ane_cache_enabled(void) {
+    const char *env = getenv("H3_ANE_CACHE");
+    return !env || atoi(env) != 0;
+}
+
+void h3_ane_cache_write_sources(void *dir, void *program, void *weights) {
+    NSString *directory = (__bridge NSString *)dir;
+    NSFileManager *files = [NSFileManager defaultManager];
+    [files createDirectoryAtPath:
+        [directory stringByAppendingPathComponent:@"weights"]
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    [(__bridge NSData *)program writeToFile:
+        [directory stringByAppendingPathComponent:@"model.mil"] atomically:YES];
+    [(__bridge NSData *)weights writeToFile:
+        [directory stringByAppendingPathComponent:@"weights/weight.bin"]
+        atomically:YES];
+}
+
+static NSString *ane_cache_entry(NSString *identifier) {
+    return [[NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"h3-ane-cache"]
+        stringByAppendingPathComponent:identifier];
+}
+
+/* Hardlink a directory tree (same volume, so links are free); copy as the
+ * fallback. The destination is replaced. */
+static bool ane_mirror(NSString *from, NSString *to) {
+    NSFileManager *files = [NSFileManager defaultManager];
+    [files removeItemAtPath:to error:nil];
+    [files createDirectoryAtPath:[to stringByDeletingLastPathComponent]
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([files linkItemAtPath:from toPath:to error:nil]) return true;
+    [files removeItemAtPath:to error:nil];
+    return [files copyItemAtPath:from toPath:to error:nil];
+}
+
+/* The model unload deletes its staging directory, so compiled artifacts are
+ * preserved in a content-addressed entry next to it and restored on reuse. */
+bool h3_ane_cache_restore(void *ident, void *dir) {
+    NSString *identifier = (__bridge NSString *)ident;
+    NSString *entry = ane_cache_entry(identifier);
+    NSFileManager *files = [NSFileManager defaultManager];
+    if (![files fileExistsAtPath:
+            [entry stringByAppendingPathComponent:@"compiled.ok"]])
+        return false;
+    NSString *directory = (__bridge NSString *)dir;
+    if (!ane_mirror(entry, directory)) return false;
+    [files removeItemAtPath:
+        [directory stringByAppendingPathComponent:@"compiled.ok"] error:nil];
+    return true;
+}
+
+void h3_ane_cache_store(void *ident, void *dir) {
+    NSString *identifier = (__bridge NSString *)ident;
+    NSString *entry = ane_cache_entry(identifier);
+    if (!ane_mirror((__bridge NSString *)dir, entry)) return;
+    [[NSData data] writeToFile:
+        [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
+}
+
+/* Freeing a model with the cache disabled also evicts its entry. */
+void h3_ane_cache_evict(const char *identifier) {
+    if (!identifier) return;
+    [[NSFileManager defaultManager]
+        removeItemAtPath:ane_cache_entry(@(identifier)) error:nil];
 }
 
 int h3_ane_linear_available(void) {
@@ -409,36 +477,55 @@ static h3_ane_linear *ane_build(const char *name, uint8_t *blob,
         NSString *directory = [NSTemporaryDirectory()
             stringByAppendingPathComponent:identifier];
         NSFileManager *files = [NSFileManager defaultManager];
-        [files createDirectoryAtPath:
-            [directory stringByAppendingPathComponent:@"weights"]
-            withIntermediateDirectories:YES attributes:nil error:nil];
-        [program writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-                  atomically:YES];
-        [weights writeToFile:[directory
-            stringByAppendingPathComponent:@"weights/weight.bin"]
-                  atomically:YES];
+        bool cache = h3_ane_cache_enabled();
+        bool cached = cache &&
+            h3_ane_cache_restore((__bridge void *)identifier,
+                                 (__bridge void *)directory);
+        if (getenv("H3_ANE_CACHE_DEBUG"))
+            fprintf(stderr, "cache-debug %s id=%s cached=%d\n", name,
+                    identifier.UTF8String, cached);
+        if (!cached)
+            h3_ane_cache_write_sources((__bridge void *)directory,
+                                       (__bridge void *)program,
+                                       (__bridge void *)weights);
         linear->temporary_directory = strdup(directory.UTF8String);
         double started = ane_seconds();
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(compileWithQoS:options:error:), 21, @{},
-                &failure)) {
-            ane_fail(error, error_size, "ANE %s compile failed: %s", name,
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            [files removeItemAtPath:directory error:nil];
-            free(linear->temporary_directory);
-            free(linear);
-            return NULL;
-        }
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        bool loaded = cached &&
+            ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
                 model, @selector(loadWithQoS:options:error:), 21, @{},
-                &failure)) {
-            ane_fail(error, error_size, "ANE %s load failed: %s", name,
-                     failure ? failure.localizedDescription.UTF8String : "?");
-            [files removeItemAtPath:directory error:nil];
-            free(linear->temporary_directory);
-            free(linear);
-            return NULL;
+                &failure);
+        if (cached && !loaded) {
+            failure = nil;
+            h3_ane_cache_write_sources((__bridge void *)directory,
+                                       (__bridge void *)program,
+                                       (__bridge void *)weights);
         }
+        if (!loaded) {
+            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                    model, @selector(compileWithQoS:options:error:), 21, @{},
+                    &failure)) {
+                ane_fail(error, error_size, "ANE %s compile failed: %s", name,
+                         failure ? failure.localizedDescription.UTF8String : "?");
+                [files removeItemAtPath:directory error:nil];
+                free(linear->temporary_directory);
+                free(linear);
+                return NULL;
+            }
+            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                    model, @selector(loadWithQoS:options:error:), 21, @{},
+                    &failure)) {
+                ane_fail(error, error_size, "ANE %s load failed: %s", name,
+                         failure ? failure.localizedDescription.UTF8String : "?");
+                [files removeItemAtPath:directory error:nil];
+                free(linear->temporary_directory);
+                free(linear);
+                return NULL;
+            }
+            if (cache)
+                h3_ane_cache_store((__bridge void *)identifier,
+                                   (__bridge void *)directory);
+        }
+        linear->cache_hit = loaded;
         linear->compile_seconds = ane_seconds() - started;
         NSMutableArray *inputs = [NSMutableArray array];
         NSMutableArray *indices = [NSMutableArray array];
@@ -610,6 +697,10 @@ void h3_ane_linear_free(h3_ane_linear *linear) {
         if (linear->temporary_directory) {
             [[NSFileManager defaultManager]
                 removeItemAtPath:@(linear->temporary_directory) error:nil];
+            if (!h3_ane_cache_enabled())
+                h3_ane_cache_evict(strrchr(linear->temporary_directory, '/') ?
+                    strrchr(linear->temporary_directory, '/') + 1 :
+                    linear->temporary_directory);
             free(linear->temporary_directory);
         }
     }
@@ -658,6 +749,10 @@ size_t h3_ane_linear_output_bytes(const h3_ane_linear *linear) {
 
 double h3_ane_linear_compile_seconds(const h3_ane_linear *linear) {
     return linear ? linear->compile_seconds : 0.0;
+}
+
+bool h3_ane_linear_cache_hit(const h3_ane_linear *linear) {
+    return linear ? linear->cache_hit : false;
 }
 
 uint64_t h3_ane_linear_weight_bytes(const h3_ane_linear *linear) {
