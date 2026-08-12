@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+The Apple Neural Engine port (h3_ane_*.{h,m}, the ANE paths in h3_dit.c,
+tests/test_ane_*.c, scripts/) is additionally:
+
+Copyright (c) 2026 Manjeet Singh
+
+and provided under the same MIT terms as above.
