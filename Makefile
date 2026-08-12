@@ -96,6 +96,9 @@ h3_ane_linear_test: tests/test_ane_linear.o $(LIB_OBJ)
 h3_convrot_tests: tests/test_convrot_weights.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_ane_int8_test: tests/test_ane_int8.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

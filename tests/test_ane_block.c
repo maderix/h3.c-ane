@@ -1,14 +1,18 @@
 /* Block parity gate: one H3 transformer block, pure Metal against the same
  * block with its four projections on the Neural Engine.
  *
- * usage: h3_ane_block_test [ROWS]
+ * usage: h3_ane_block_test [ROWS] [int8]
  *
  * The released checkpoint is not on this machine, so the block runs on pinned
  * pseudo-random weights at the exact DiT core shapes. The op sequence is
  * h3_dit.c's refiner block: RMSNorm, QKV, Q/K norm, SDPA, output projection,
- * residual, RMSNorm, FC1, SwiGLU, FC2, residual. */
+ * residual, RMSNorm, FC1, SwiGLU, FC2, residual. With `int8` the projections
+ * are minted as ConvRot int8_tensorwise payloads: Metal consumes the
+ * dequantized+derotated BF16 form, the Neural Engine keeps int8 and rotates
+ * activations in-graph — the same split the DiT splice uses. */
 
 #include "h3_ane_linear.h"
+#include "h3_convrot.h"
 #include "h3_gpu.h"
 
 #include <math.h>
@@ -72,6 +76,47 @@ static h3_gpu_tensor *ones_bf16(h3_gpu *gpu, size_t elements) {
     h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, values, elements);
     free(values);
     return tensor;
+}
+
+/* One minted int8_tensorwise projection plus its dequantized BF16 twin. */
+typedef struct {
+    int8_t *quantized;
+    float *scales;
+    h3_gpu_tensor *bf16;
+} int8_weight;
+
+static int mint_int8(h3_gpu *gpu, int8_weight *weight, uint32_t output_dim,
+                     uint32_t input_dim) {
+    weight->quantized = malloc((size_t)output_dim * input_dim);
+    weight->scales = malloc(sizeof(float) * output_dim);
+    float *wide = malloc(sizeof(float) * output_dim * input_dim);
+    uint16_t *narrow = malloc(sizeof(uint16_t) * output_dim * input_dim);
+    if (!weight->quantized || !weight->scales || !wide || !narrow) {
+        free(wide);
+        free(narrow);
+        return 0;
+    }
+    for (uint32_t n = 0; n < output_dim; n++) {
+        weight->scales[n] = 0.02f / 127.0f * (0.5f + fabsf(next_uniform(1.0f)));
+        for (uint32_t k = 0; k < input_dim; k++) {
+            int8_t q = (int8_t)lrintf(next_uniform(127.0f));
+            weight->quantized[(size_t)n * input_dim + k] = q;
+            /* The Metal twin sees the fp16-rounded scale the graph uses. */
+            wide[(size_t)n * input_dim + k] =
+                (float)q * (float)(__fp16)weight->scales[n];
+        }
+    }
+    int ok = h3_convrot_derotate_f32(wide, output_dim, input_dim, 256);
+    if (ok) {
+        for (size_t i = 0; i < (size_t)output_dim * input_dim; i++)
+            narrow[i] = to_bf16(wide[i]);
+        weight->bf16 = h3_gpu_tensor_from_bf16(gpu, narrow,
+                                               (size_t)output_dim * input_dim);
+        ok = weight->bf16 != NULL;
+    }
+    free(wide);
+    free(narrow);
+    return ok;
 }
 
 typedef struct {
@@ -208,6 +253,7 @@ static double measure(h3_gpu *gpu, block *b, int use_ane, int repeats,
 
 int main(int argc, char **argv) {
     uint32_t rows = argc > 1 ? (uint32_t)atoi(argv[1]) : 1536;
+    int int8_mode = argc > 2 && !strcmp(argv[2], "int8");
     char error[512] = {0};
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!gpu) {
@@ -220,10 +266,26 @@ int main(int argc, char **argv) {
     }
     block b = {0};
     b.rows = rows;
-    b.qkv_weight = random_bf16(gpu, (size_t)INNER * 3 * HIDDEN, 0.02f);
-    b.out_weight = random_bf16(gpu, (size_t)HIDDEN * INNER, 0.02f);
-    b.fc1_weight = random_bf16(gpu, (size_t)FFN * 2 * HIDDEN, 0.02f);
-    b.fc2_weight = random_bf16(gpu, (size_t)HIDDEN * FFN, 0.02f);
+    int8_weight int8_weights[4] = {0};
+    if (int8_mode) {
+        printf("int8 ConvRot projections\n");
+        if (!mint_int8(gpu, &int8_weights[0], INNER * 3, HIDDEN) ||
+            !mint_int8(gpu, &int8_weights[1], HIDDEN, INNER) ||
+            !mint_int8(gpu, &int8_weights[2], FFN * 2, HIDDEN) ||
+            !mint_int8(gpu, &int8_weights[3], HIDDEN, FFN)) {
+            fprintf(stderr, "cannot mint int8 projections\n");
+            return 2;
+        }
+        b.qkv_weight = int8_weights[0].bf16;
+        b.out_weight = int8_weights[1].bf16;
+        b.fc1_weight = int8_weights[2].bf16;
+        b.fc2_weight = int8_weights[3].bf16;
+    } else {
+        b.qkv_weight = random_bf16(gpu, (size_t)INNER * 3 * HIDDEN, 0.02f);
+        b.out_weight = random_bf16(gpu, (size_t)HIDDEN * INNER, 0.02f);
+        b.fc1_weight = random_bf16(gpu, (size_t)FFN * 2 * HIDDEN, 0.02f);
+        b.fc2_weight = random_bf16(gpu, (size_t)HIDDEN * FFN, 0.02f);
+    }
     b.norm1 = ones_bf16(gpu, HIDDEN);
     b.norm2 = ones_bf16(gpu, HIDDEN);
     b.q_norm = ones_bf16(gpu, HEAD_DIM);
@@ -260,18 +322,36 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < elements; i++) reference[i] = from_bf16(raw[i]);
 
     double compile_started = seconds();
-    b.ane_qkv = h3_ane_projection_create(gpu, "qkv", b.qkv_weight, HIDDEN,
-        INNER * 3, rows, h3_ane_linear_default_chunk(HIDDEN), error,
-        sizeof(error));
-    b.ane_out = b.ane_qkv ? h3_ane_projection_create(gpu, "out", b.out_weight,
-        INNER, HIDDEN, rows, h3_ane_linear_default_chunk(INNER), error,
-        sizeof(error)) : NULL;
-    b.ane_fc1 = b.ane_out ? h3_ane_projection_create(gpu, "fc1", b.fc1_weight,
-        HIDDEN, FFN * 2, rows, h3_ane_linear_default_chunk(HIDDEN), error,
-        sizeof(error)) : NULL;
-    b.ane_fc2 = b.ane_fc1 ? h3_ane_projection_create(gpu, "fc2", b.fc2_weight,
-        FFN, HIDDEN, rows, h3_ane_linear_default_chunk(FFN), error,
-        sizeof(error)) : NULL;
+    if (int8_mode) {
+        struct { const char *name; int which; uint32_t in, out; } spec[4] = {
+            {"qkv", 0, HIDDEN, INNER * 3}, {"out", 1, INNER, HIDDEN},
+            {"fc1", 2, HIDDEN, FFN * 2}, {"fc2", 3, FFN, HIDDEN}
+        };
+        h3_ane_projection **slots[4] = {
+            &b.ane_qkv, &b.ane_out, &b.ane_fc1, &b.ane_fc2
+        };
+        for (int i = 0; i < 4; i++) {
+            *slots[i] = h3_ane_projection_create_int8_raw(
+                gpu, spec[i].name, int8_weights[spec[i].which].quantized,
+                int8_weights[spec[i].which].scales, 256, spec[i].in,
+                spec[i].out, rows, h3_ane_linear_default_chunk(spec[i].in),
+                error, sizeof(error));
+            if (!*slots[i]) break;
+        }
+    } else {
+        b.ane_qkv = h3_ane_projection_create(gpu, "qkv", b.qkv_weight, HIDDEN,
+            INNER * 3, rows, h3_ane_linear_default_chunk(HIDDEN), error,
+            sizeof(error));
+        b.ane_out = b.ane_qkv ? h3_ane_projection_create(gpu, "out",
+            b.out_weight, INNER, HIDDEN, rows,
+            h3_ane_linear_default_chunk(INNER), error, sizeof(error)) : NULL;
+        b.ane_fc1 = b.ane_out ? h3_ane_projection_create(gpu, "fc1",
+            b.fc1_weight, HIDDEN, FFN * 2, rows,
+            h3_ane_linear_default_chunk(HIDDEN), error, sizeof(error)) : NULL;
+        b.ane_fc2 = b.ane_fc1 ? h3_ane_projection_create(gpu, "fc2",
+            b.fc2_weight, FFN, HIDDEN, rows,
+            h3_ane_linear_default_chunk(FFN), error, sizeof(error)) : NULL;
+    }
     if (!b.ane_fc2) {
         fprintf(stderr, "cannot build the ANE projections: %s\n", error);
         return 1;

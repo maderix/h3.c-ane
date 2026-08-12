@@ -1,7 +1,12 @@
 /* Integration gate: one real h3_dit forward, pure Metal against the same
  * forward with H3_ANE_LINEARS=1.
  *
- * usage: h3_ane_dit_test [DIRECTORY] [ANE_BLOCKS]
+ * usage: h3_ane_dit_test [DIRECTORY] [ANE_BLOCKS] [ACTIVE_BLOCKS] [int8]
+ *
+ * With `int8` the core-block projections are minted as ConvRot
+ * int8_tensorwise payloads (per-row F32 scales + comfy_quant markers, refiner
+ * kept BF16 like the released checkpoint), so the Metal run exercises the
+ * dequantizing loader and the ANE run the native int8 graphs.
  *
  * The released checkpoint does not fit on this machine, so the test mints a
  * synthetic DiT once and reuses it. Every block name points at the same tensor
@@ -60,6 +65,10 @@ static uint16_t to_bf16(float value) {
     return (uint16_t)(bits >> 16);
 }
 
+static const char int8_marker[] =
+    "{\"format\": \"int8_tensorwise\", \"convrot\": true, "
+    "\"convrot_groupsize\": 256}";
+
 /* One unique payload. Many tensor names may reference the same entry. */
 typedef struct {
     const char *dtype;
@@ -70,6 +79,8 @@ typedef struct {
     int rope;
     uint64_t offset;
     uint64_t bytes;
+    int int8_scale;     /* per-row dequantization scale payload */
+    int marker;         /* comfy_quant marker payload */
 } payload;
 
 enum {
@@ -78,33 +89,46 @@ enum {
     P_TIME_IN_W, P_TIME_IN_B, P_TIME_OUT_W, P_TIME_OUT_B,
     P_ROPE, P_VIDEO_PATCH_W, P_PATCH_B, P_AUDIO_PATCH_W,
     P_FINAL_VIDEO_W, P_FINAL_VIDEO_B, P_FINAL_AUDIO_W, P_FINAL_AUDIO_B,
+    P_QKV_SCALE, P_OUT_SCALE, P_FC1_SCALE, P_FC2_SCALE, P_MARKER,
+    P_R_QKV, P_R_OUT, P_R_FC1, P_R_FC2,
     P_COUNT
 };
 
+static int int8_mint = 0;
+
 static payload payloads[P_COUNT] = {
-    [P_NORM_HIDDEN]    = {"BF16", HIDDEN, 0, 0.05f, 1.0f, 0, 0, 0},
-    [P_QKV]            = {"BF16", 3 * INNER, HIDDEN, 0.02f, 0.0f, 0, 0, 0},
-    [P_HEAD_NORM]      = {"BF16", HEAD_DIM, 0, 0.05f, 1.0f, 0, 0, 0},
-    [P_OUT]            = {"BF16", HIDDEN, INNER, 0.02f, 0.0f, 0, 0, 0},
-    [P_FC1]            = {"BF16", 2 * FFN, HIDDEN, 0.02f, 0.0f, 0, 0, 0},
-    [P_FC2]            = {"BF16", HIDDEN, FFN, 0.02f, 0.0f, 0, 0, 0},
-    [P_CONDITION]      = {"BF16", HIDDEN, TEXT_DIM, 0.02f, 0.0f, 0, 0, 0},
-    [P_ADALN_W]        = {"BF16", BLOCK_OUTPUT, TIME_DIM, 0.005f, 0.0f, 0, 0, 0},
-    [P_ADALN_B]        = {"BF16", BLOCK_OUTPUT, 0, 0.005f, 0.0f, 0, 0, 0},
-    [P_FINAL_ADALN_W]  = {"BF16", FINAL_OUTPUT, TIME_DIM, 0.005f, 0.0f, 0, 0, 0},
-    [P_FINAL_ADALN_B]  = {"BF16", FINAL_OUTPUT, 0, 0.005f, 0.0f, 0, 0, 0},
-    [P_TIME_IN_W]      = {"F32", HIDDEN, TIME_INPUT, 0.02f, 0.0f, 0, 0, 0},
-    [P_TIME_IN_B]      = {"F32", HIDDEN, 0, 0.01f, 0.0f, 0, 0, 0},
-    [P_TIME_OUT_W]     = {"F32", TIME_DIM, HIDDEN, 0.02f, 0.0f, 0, 0, 0},
-    [P_TIME_OUT_B]     = {"F32", TIME_DIM, 0, 0.01f, 0.0f, 0, 0, 0},
-    [P_ROPE]           = {"F32", 16, 0, 0.0f, 0.0f, 1, 0, 0},
-    [P_VIDEO_PATCH_W]  = {"F32", HIDDEN, VIDEO_PATCH, 0.05f, 0.0f, 0, 0, 0},
-    [P_PATCH_B]        = {"F32", HIDDEN, 0, 0.01f, 0.0f, 0, 0, 0},
-    [P_AUDIO_PATCH_W]  = {"F32", HIDDEN, AUDIO_CHANNELS, 0.05f, 0.0f, 0, 0, 0},
-    [P_FINAL_VIDEO_W]  = {"F32", VIDEO_PATCH, HIDDEN, 0.02f, 0.0f, 0, 0, 0},
-    [P_FINAL_VIDEO_B]  = {"F32", VIDEO_PATCH, 0, 0.01f, 0.0f, 0, 0, 0},
-    [P_FINAL_AUDIO_W]  = {"F32", AUDIO_CHANNELS, HIDDEN, 0.02f, 0.0f, 0, 0, 0},
-    [P_FINAL_AUDIO_B]  = {"F32", AUDIO_CHANNELS, 0, 0.01f, 0.0f, 0, 0, 0}
+    [P_NORM_HIDDEN]    = {"BF16", HIDDEN, 0, 0.05f, 1.0f, 0, 0, 0, 0, 0},
+    [P_QKV]            = {"BF16", 3 * INNER, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_HEAD_NORM]      = {"BF16", HEAD_DIM, 0, 0.05f, 1.0f, 0, 0, 0, 0, 0},
+    [P_OUT]            = {"BF16", HIDDEN, INNER, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FC1]            = {"BF16", 2 * FFN, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FC2]            = {"BF16", HIDDEN, FFN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_QKV_SCALE]      = {"F32", 3 * INNER, 1, 0, 0, 0, 0, 0, 1, 0},
+    [P_OUT_SCALE]      = {"F32", HIDDEN, 1, 0, 0, 0, 0, 0, 1, 0},
+    [P_FC1_SCALE]      = {"F32", 2 * FFN, 1, 0, 0, 0, 0, 0, 1, 0},
+    [P_FC2_SCALE]      = {"F32", HIDDEN, 1, 0, 0, 0, 0, 0, 1, 0},
+    [P_MARKER]         = {"U8", sizeof(int8_marker) - 1, 0, 0, 0, 0, 0, 0, 0, 1},
+    [P_R_QKV]          = {"BF16", 3 * INNER, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_R_OUT]          = {"BF16", HIDDEN, INNER, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_R_FC1]          = {"BF16", 2 * FFN, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_R_FC2]          = {"BF16", HIDDEN, FFN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_CONDITION]      = {"BF16", HIDDEN, TEXT_DIM, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_ADALN_W]        = {"BF16", BLOCK_OUTPUT, TIME_DIM, 0.005f, 0.0f, 0, 0, 0, 0, 0},
+    [P_ADALN_B]        = {"BF16", BLOCK_OUTPUT, 0, 0.005f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_ADALN_W]  = {"BF16", FINAL_OUTPUT, TIME_DIM, 0.005f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_ADALN_B]  = {"BF16", FINAL_OUTPUT, 0, 0.005f, 0.0f, 0, 0, 0, 0, 0},
+    [P_TIME_IN_W]      = {"F32", HIDDEN, TIME_INPUT, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_TIME_IN_B]      = {"F32", HIDDEN, 0, 0.01f, 0.0f, 0, 0, 0, 0, 0},
+    [P_TIME_OUT_W]     = {"F32", TIME_DIM, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_TIME_OUT_B]     = {"F32", TIME_DIM, 0, 0.01f, 0.0f, 0, 0, 0, 0, 0},
+    [P_ROPE]           = {"F32", 16, 0, 0.0f, 0.0f, 1, 0, 0, 0, 0},
+    [P_VIDEO_PATCH_W]  = {"F32", HIDDEN, VIDEO_PATCH, 0.05f, 0.0f, 0, 0, 0, 0, 0},
+    [P_PATCH_B]        = {"F32", HIDDEN, 0, 0.01f, 0.0f, 0, 0, 0, 0, 0},
+    [P_AUDIO_PATCH_W]  = {"F32", HIDDEN, AUDIO_CHANNELS, 0.05f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_VIDEO_W]  = {"F32", VIDEO_PATCH, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_VIDEO_B]  = {"F32", VIDEO_PATCH, 0, 0.01f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_AUDIO_W]  = {"F32", AUDIO_CHANNELS, HIDDEN, 0.02f, 0.0f, 0, 0, 0, 0, 0},
+    [P_FINAL_AUDIO_B]  = {"F32", AUDIO_CHANNELS, 0, 0.01f, 0.0f, 0, 0, 0, 0, 0}
 };
 
 typedef struct {
@@ -127,33 +151,59 @@ static void add(const char *format, int which, unsigned index) {
     entry_count++;
 }
 
-static void add_block(const char *prefix) {
+static void add_block(const char *prefix, int int8_projections) {
     char format[96];
+    /* When the core blocks are int8, the refiner keeps BF16 twins so the
+     * synthetic file mirrors the released checkpoint's dtype split. */
+    int refiner = int8_mint && !int8_projections;
     struct { const char *suffix; int which; } fields[8] = {
         {"norm1.weight", P_NORM_HIDDEN}, {"norm2.weight", P_NORM_HIDDEN},
-        {"attn.qkv_proj.weight", P_QKV}, {"attn.q_norm.weight", P_HEAD_NORM},
-        {"attn.k_norm.weight", P_HEAD_NORM}, {"attn.out_proj.weight", P_OUT},
-        {"mlp.fc1.weight", P_FC1}, {"mlp.fc2.weight", P_FC2}
+        {"attn.qkv_proj.weight", refiner ? P_R_QKV : P_QKV},
+        {"attn.q_norm.weight", P_HEAD_NORM},
+        {"attn.k_norm.weight", P_HEAD_NORM},
+        {"attn.out_proj.weight", refiner ? P_R_OUT : P_OUT},
+        {"mlp.fc1.weight", refiner ? P_R_FC1 : P_FC1},
+        {"mlp.fc2.weight", refiner ? P_R_FC2 : P_FC2}
     };
     for (int i = 0; i < 8; i++) {
         snprintf(format, sizeof(format), "%s%s", prefix, fields[i].suffix);
         add(format, fields[i].which, 0);
     }
+    if (!int8_projections) return;
+    struct { const char *stem; int scale_which; } stems[4] = {
+        {"attn.qkv_proj", P_QKV_SCALE}, {"attn.out_proj", P_OUT_SCALE},
+        {"mlp.fc1", P_FC1_SCALE}, {"mlp.fc2", P_FC2_SCALE}
+    };
+    for (int i = 0; i < 4; i++) {
+        snprintf(format, sizeof(format), "%s%s.weight_scale", prefix,
+                 stems[i].stem);
+        add(format, stems[i].scale_which, 0);
+        snprintf(format, sizeof(format), "%s%s.comfy_quant", prefix,
+                 stems[i].stem);
+        add(format, P_MARKER, 0);
+    }
 }
 
 static void build_entries(void) {
+    if (int8_mint) {
+        payloads[P_QKV].dtype = "I8";
+        payloads[P_OUT].dtype = "I8";
+        payloads[P_FC1].dtype = "I8";
+        payloads[P_FC2].dtype = "I8";
+    }
     for (unsigned block = 0; block < BLOCKS; block++) {
         char prefix[32];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", block);
-        add_block(prefix);
+        add_block(prefix, int8_mint);
         char name[96];
         snprintf(name, sizeof(name), "blocks.%u.adaln_proj.linear.weight", block);
         add(name, P_ADALN_W, 0);
         snprintf(name, sizeof(name), "blocks.%u.adaln_proj.linear.bias", block);
         add(name, P_ADALN_B, 0);
     }
-    add_block("token_refiner.blocks.0.");
-    add_block("token_refiner.blocks.1.");
+    /* The refiner stays BF16 in the released int8 checkpoint too. */
+    add_block("token_refiner.blocks.0.", 0);
+    add_block("token_refiner.blocks.1.", 0);
     add("token_refiner.final_norm.weight", P_NORM_HIDDEN, 0);
     add("condition_proj.weight", P_CONDITION, 0);
     add("condition_proj.bias", P_NORM_HIDDEN, 0);
@@ -175,27 +225,41 @@ static void build_entries(void) {
     add("final_layer.audio_out.bias", P_FINAL_AUDIO_B, 0);
 }
 
+static size_t dtype_bytes(const char *dtype) {
+    if (!strcmp(dtype, "F32")) return 4;
+    if (!strcmp(dtype, "I8") || !strcmp(dtype, "U8")) return 1;
+    return 2;
+}
+
 static int write_payload(FILE *file, const payload *entry_payload) {
     uint64_t elements = entry_payload->rows *
         (entry_payload->columns ? entry_payload->columns : 1);
-    int wide = !strcmp(entry_payload->dtype, "F32");
+    if (entry_payload->marker)
+        return fwrite(int8_marker, 1, (size_t)elements, file) == elements;
+    size_t width = dtype_bytes(entry_payload->dtype);
     size_t chunk = 1u << 16;
-    void *buffer = malloc(chunk * (wide ? 4 : 2));
+    void *buffer = malloc(chunk * width);
     if (!buffer) return 0;
     uint64_t written = 0;
     while (written < elements) {
         uint64_t count = elements - written < chunk ? elements - written : chunk;
         for (uint64_t i = 0; i < count; i++) {
+            if (width == 1) {
+                ((int8_t *)buffer)[i] = (int8_t)lrintf(next_uniform(127.0f));
+                continue;
+            }
             float value;
             if (entry_payload->rope)
                 value = 1.0f / powf(10000.0f,
                                     (float)(written + i) * 2.0f / 32.0f);
+            else if (entry_payload->int8_scale)
+                value = 0.02f / 127.0f * (0.5f + fabsf(next_uniform(1.0f)));
             else
                 value = entry_payload->centre + next_uniform(entry_payload->scale);
-            if (wide) ((float *)buffer)[i] = value;
+            if (width == 4) ((float *)buffer)[i] = value;
             else ((uint16_t *)buffer)[i] = to_bf16(value);
         }
-        if (fwrite(buffer, wide ? 4 : 2, (size_t)count, file) != count) {
+        if (fwrite(buffer, width, (size_t)count, file) != count) {
             free(buffer);
             return 0;
         }
@@ -208,11 +272,13 @@ static int write_payload(FILE *file, const payload *entry_payload) {
 static int mint(const char *path) {
     FILE *file = fopen(path, "wb");
     if (!file) { fprintf(stderr, "cannot create %s\n", path); return 0; }
+    int referenced[P_COUNT] = {0};
+    for (size_t i = 0; i < entry_count; i++) referenced[entries[i].payload] = 1;
     uint64_t cursor = 0;
     for (int i = 0; i < P_COUNT; i++) {
         payload *p = &payloads[i];
         uint64_t elements = p->rows * (p->columns ? p->columns : 1);
-        p->bytes = elements * (!strcmp(p->dtype, "F32") ? 4u : 2u);
+        p->bytes = referenced[i] ? elements * dtype_bytes(p->dtype) : 0;
         p->offset = cursor;
         cursor += p->bytes;
         cursor = (cursor + 63u) & ~UINT64_C(63);
@@ -247,6 +313,7 @@ static int mint(const char *path) {
     for (size_t i = used; i < padded; i++) fputc(' ', file);
     free(header);
     for (int i = 0; i < P_COUNT; i++) {
+        if (!payloads[i].bytes) continue;
         long target = (long)(8 + padded + payloads[i].offset);
         if (fseek(file, target, SEEK_SET) != 0 ||
             !write_payload(file, &payloads[i])) {
@@ -395,6 +462,7 @@ int main(int argc, char **argv) {
         "/Users/maderix/m4scratch/h3_synth_dit";
     const char *ane_blocks = argc > 2 ? argv[2] : "2";
     if (argc > 3) active_blocks = (unsigned)atoi(argv[3]);
+    int8_mint = argc > 4 && !strcmp(argv[4], "int8");
     char path[1024];
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
     build_entries();

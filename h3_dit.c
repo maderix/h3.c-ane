@@ -1296,24 +1296,38 @@ static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
                              char *error, size_t error_size) {
     struct {
         const char *label;
+        const char *suffix;
         h3_ane_projection **slot;
         const h3_gpu_tensor *weight;
         uint32_t input_dim;
         uint32_t output_dim;
     } plan[4] = {
-        {"qkv", &block->ane_qkv, block->qkv, HIDDEN, INNER * 3},
-        {"out", &block->ane_out, block->out, INNER, HIDDEN},
-        {"fc1", &block->ane_fc1, block->fc1, HIDDEN, FFN * 2},
-        {"fc2", &block->ane_fc2, block->fc2, FFN, HIDDEN}
+        {"qkv", "attn.qkv_proj.weight", &block->ane_qkv, block->qkv,
+         HIDDEN, INNER * 3},
+        {"out", "attn.out_proj.weight", &block->ane_out, block->out,
+         INNER, HIDDEN},
+        {"fc1", "mlp.fc1.weight", &block->ane_fc1, block->fc1,
+         HIDDEN, FFN * 2},
+        {"fc2", "mlp.fc2.weight", &block->ane_fc2, block->fc2,
+         FFN, HIDDEN}
     };
     for (int entry = 0; entry < 4; entry++) {
-        char label[48];
+        char label[48], name[96];
         snprintf(label, sizeof(label), "block %u %s", index, plan[entry].label);
-        *plan[entry].slot = h3_ane_projection_create(
-            dit->gpu, label, plan[entry].weight, plan[entry].input_dim,
-            plan[entry].output_dim, dit->sequence,
-            h3_ane_linear_default_chunk(plan[entry].input_dim), error,
-            error_size);
+        snprintf(name, sizeof(name), "blocks.%u.%s", index,
+                 plan[entry].suffix);
+        const h3_st_tensor *stored = h3_weight_find(dit->weights, name, NULL);
+        *plan[entry].slot = stored && stored->dtype == H3_DTYPE_I8 ?
+            h3_ane_projection_create_int8(
+                dit->gpu, label, dit->weights, name, plan[entry].input_dim,
+                plan[entry].output_dim, dit->sequence,
+                h3_ane_linear_default_chunk(plan[entry].input_dim), error,
+                error_size) :
+            h3_ane_projection_create(
+                dit->gpu, label, plan[entry].weight, plan[entry].input_dim,
+                plan[entry].output_dim, dit->sequence,
+                h3_ane_linear_default_chunk(plan[entry].input_dim), error,
+                error_size);
         if (!*plan[entry].slot) return 0;
     }
     uint64_t released_bytes = 0;

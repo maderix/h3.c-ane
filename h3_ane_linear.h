@@ -26,6 +26,18 @@ h3_ane_linear *h3_ane_linear_create(const char *name, const void *weights,
                                     uint32_t rows, uint32_t kc,
                                     char *error, size_t error_size);
 
+/* comfy-quants int8_tensorwise payload: row-major [output_dim][input_dim]
+ * int8 with per-row f32 scales, kept int8 on the Neural Engine through
+ * constexpr dequantization. A positive convrot_group_size adds the in-graph
+ * grouped Hadamard activation rotation that the stored rows expect. */
+h3_ane_linear *h3_ane_linear_create_int8(const char *name,
+                                    const int8_t *quantized,
+                                    const float *scales,
+                                    int convrot_group_size,
+                                    uint32_t input_dim, uint32_t output_dim,
+                                    uint32_t rows, uint32_t kc,
+                                    char *error, size_t error_size);
+
 /* Payload that is already chunks x [output_dim][kc] fp16 with the K padding
  * zeroed. Used by the fixture gate. */
 h3_ane_linear *h3_ane_linear_create_chunked(const char *name,
@@ -61,6 +73,7 @@ uint64_t h3_ane_linear_weight_bytes(const h3_ane_linear *linear);
  * planes the Neural Engine reads. */
 
 #include "h3_gpu.h"
+#include "h3_weights.h"
 
 typedef struct h3_ane_projection h3_ane_projection;
 
@@ -69,6 +82,25 @@ uint32_t h3_ane_linear_default_chunk(uint32_t input_dim);
 
 h3_ane_projection *h3_ane_projection_create(h3_gpu *gpu, const char *name,
                                     const h3_gpu_tensor *weight,
+                                    uint32_t input_dim, uint32_t output_dim,
+                                    uint32_t rows, uint32_t kc,
+                                    char *error, size_t error_size);
+
+/* Build the projection straight from a stored int8_tensorwise weight; the
+ * raw payload is read, packed into the graph, and released. */
+h3_ane_projection *h3_ane_projection_create_int8(h3_gpu *gpu, const char *name,
+                                    const h3_weight_store *store,
+                                    const char *weight_name,
+                                    uint32_t input_dim, uint32_t output_dim,
+                                    uint32_t rows, uint32_t kc,
+                                    char *error, size_t error_size);
+
+/* As above from an in-memory int8 payload. */
+h3_ane_projection *h3_ane_projection_create_int8_raw(h3_gpu *gpu,
+                                    const char *name,
+                                    const int8_t *quantized,
+                                    const float *scales,
+                                    int convrot_group_size,
                                     uint32_t input_dim, uint32_t output_dim,
                                     uint32_t rows, uint32_t kc,
                                     char *error, size_t error_size);
