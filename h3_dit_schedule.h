@@ -19,6 +19,15 @@ typedef struct h3_dit_schedule h3_dit_schedule;
 typedef void (*h3_dit_schedule_progress)(int completed_blocks,
                                          int total_blocks, void *opaque);
 
+/* Comfy adaln-curve time embedding: t in [0,1] linearly interpolates
+ * adjacent adaln_t_table rows (SiLU baked into the curve). Returns BF16
+ * [rows][table width] and reports the width. */
+h3_gpu_tensor *h3_dit_time_curve_embeddings(const h3_weight_store *weights,
+                                            h3_gpu *gpu, uint32_t rows,
+                                            const float *times,
+                                            uint32_t *time_dim_out,
+                                            char *error, size_t error_size);
+
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the
  * next is loaded. */

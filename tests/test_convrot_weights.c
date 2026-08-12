@@ -8,6 +8,7 @@
  * precision. */
 
 #include "h3_convrot.h"
+#include "h3_dit_schedule.h"
 #include "h3_gpu.h"
 #include "h3_text_encoder.h"
 #include "h3_weights.h"
@@ -453,6 +454,55 @@ static void real_checkpoint_gate(h3_gpu *gpu, const char *directory) {
     h3_weight_store_free(store);
 }
 
+/* Adaln-curve lerp gate: a tiny table fixture, times spanning the clamp and
+ * interior cases, checked against the ComfyUI reference formula
+ * lerp(table[floor(t*(grid-1))], table[floor+1], frac) with edge clamping. */
+static void curve_gates(h3_gpu *gpu, const char *directory) {
+    char error[512] = {0};
+    enum { GRID = 5, WIDTH = 4 };
+    static float table[GRID][WIDTH];
+    for (int g = 0; g < GRID; g++)
+        for (int w = 0; w < WIDTH; w++)
+            table[g][w] = (float)(g * g) * 0.25f + (float)w * 0.125f;
+    fixture_t fixture = {0};
+    fixture_add(&fixture, "adaln_t_table", "F32", "[5,4]",
+                table, sizeof(table));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/curve_fixture.safetensors", directory);
+    check(fixture_write(&fixture, path), "curve fixture written");
+    h3_weight_store *store = h3_weight_store_open(directory, error,
+                                                  sizeof(error));
+    check(store != NULL, "curve store opens");
+    if (!store) return;
+    float times[5] = {-0.5f, 0.0f, 0.30f, 0.99f, 1.5f};
+    uint32_t width = 0;
+    h3_gpu_tensor *rows = h3_dit_time_curve_embeddings(
+        store, gpu, 5, times, &width, error, sizeof(error));
+    check(rows != NULL && width == WIDTH, "curve rows build at table width");
+    if (rows) {
+        uint16_t loaded[5 * WIDTH];
+        h3_gpu_tensor_read_bf16(rows, loaded, 5 * WIDTH);
+        double worst = 0;
+        for (int row = 0; row < 5; row++) {
+            float t = times[row] < 0 ? 0 : (times[row] > 1 ? 1.0f : times[row]);
+            float position = t * (GRID - 1);
+            int low = (int)position;
+            if (low > GRID - 2) low = GRID - 2;
+            float blend = position - (float)low;
+            for (int w = 0; w < WIDTH; w++) {
+                float want = table[low][w] +
+                             (table[low + 1][w] - table[low][w]) * blend;
+                float got = f32_from_bf16(loaded[row * WIDTH + w]);
+                worst = fmax(worst, fabs((double)got - want));
+            }
+        }
+        check(worst <= 0.02, "curve lerp and clamping match the reference");
+        h3_gpu_tensor_free(rows);
+    } else printf("  %s\n", error);
+    h3_weight_store_free(store);
+    unlink(path);
+}
+
 int main(int argc, char **argv) {
     hadamard_table_gates();
     derotate_gates();
@@ -469,6 +519,7 @@ int main(int argc, char **argv) {
     }
     loader_gates(gpu, directory);
     conditioning_gates(directory);
+    curve_gates(gpu, directory);
     rmdir(directory);
     if (argc > 1) real_checkpoint_gate(gpu, argv[1]);
     h3_gpu_free(gpu);
