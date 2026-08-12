@@ -232,3 +232,6 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 \
 	libh3.a *.o *.d tests/*.o tests/*.d
+
+h3_vae_noise_test: tests/test_vae_noise.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)

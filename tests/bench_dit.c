@@ -1894,8 +1894,35 @@ int main(int argc, char **argv) {
             video[element] += video_velocity[element] * 0.001f;
         for (size_t element = 0; element < AUDIO_ELEMENTS; element++)
             audio[element] += audio_velocity[element] * 0.001f;
-        printf("  core %zu step %d %.3fs\n", index + 1, steps[index],
-               seconds() - step_start);
+        const char *dump = getenv("H3_BENCH_DUMP_VEL");
+        if (dump && index == 0) {
+            FILE *out = fopen(dump, "wb");
+            if (out) {
+                fwrite(video_velocity, sizeof(*video_velocity),
+                       VIDEO_ELEMENTS, out);
+                fwrite(audio_velocity, sizeof(*audio_velocity),
+                       AUDIO_ELEMENTS, out);
+                fclose(out);
+            }
+        }
+        double vmean = 0, vsq = 0, vmax = 0;
+        for (size_t element = 0; element < VIDEO_ELEMENTS; element++) {
+            double value = video_velocity[element];
+            vmean += value; vsq += value * value;
+            if (fabs(value) > vmax) vmax = fabs(value);
+        }
+        vmean /= VIDEO_ELEMENTS;
+        double amean = 0, asq = 0;
+        for (size_t element = 0; element < AUDIO_ELEMENTS; element++) {
+            double value = audio_velocity[element];
+            amean += value; asq += value * value;
+        }
+        amean /= AUDIO_ELEMENTS;
+        printf("  core %zu step %d %.3fs  v_vel mean=%.4f std=%.4f max=%.3f  "
+               "a_vel mean=%.4f std=%.4f\n", index + 1, steps[index],
+               seconds() - step_start, vmean,
+               sqrt(vsq / VIDEO_ELEMENTS - vmean * vmean), vmax,
+               amean, sqrt(asq / AUDIO_ELEMENTS - amean * amean));
     }
     double forward_seconds = seconds() - forward_start;
     printf("DiT %ux%u load %.3fs, %zu forwards %.3fs, combined %.3fs; "

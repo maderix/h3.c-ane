@@ -72,6 +72,7 @@ typedef struct {
     float *scales;
     int group_size;
     int int8;
+    int qkv_grouped;   /* remap conventional [q|k|v] rows while streaming */
 } h3_dit_stream_source;
 
 typedef struct {
@@ -101,6 +102,10 @@ struct h3_dit {
     unsigned ane_block_limit;
     unsigned ane_block_count;
     int ssd_streaming;
+    /* Comfy exports store qkv_proj rows as conventional [q|k|v] blocks; the
+     * official checkpoint interleaves [head][q/k/v][dim], which every h3
+     * attention kernel expects. Detected via the adaln_t_table marker. */
+    int conventional_qkv;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -513,6 +518,36 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+/* Row map from the comfy [q|k|v] block order to the grouped [head][q/k/v][dim]
+ * order the attention kernels expect. Rows move in dim-sized runs. */
+static size_t grouped_qkv_row(size_t conventional_row) {
+    size_t stream = conventional_row / INNER;          /* q/k/v */
+    size_t head = (conventional_row % INNER) / HEAD_DIM;
+    size_t lane = conventional_row % HEAD_DIM;
+    return (head * 3 + stream) * HEAD_DIM + lane;
+}
+
+static int normalize_grouped_qkv_bf16(h3_dit *dit, h3_gpu_tensor *tensor,
+                                      char *error, size_t error_size) {
+    if (!dit->conventional_qkv) return 1;
+    size_t rows = (size_t)INNER * 3;
+    size_t elements = rows * HIDDEN;
+    uint16_t *source = malloc(elements * sizeof(*source));
+    uint16_t *grouped = malloc(elements * sizeof(*grouped));
+    int ok = source && grouped &&
+             h3_gpu_tensor_read_bf16(tensor, source, elements);
+    if (ok) {
+        for (size_t row = 0; row < rows; row++)
+            memcpy(grouped + grouped_qkv_row(row) * HIDDEN,
+                   source + row * HIDDEN, HIDDEN * sizeof(*grouped));
+        ok = h3_gpu_tensor_write_bf16(tensor, grouped, elements);
+    }
+    if (!ok) fail(error, error_size, "cannot regroup a conventional QKV");
+    free(source);
+    free(grouped);
+    return ok;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
@@ -529,6 +564,8 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     LOAD1(norm1, "norm1.weight", HIDDEN);
     LOAD1(norm2, "norm2.weight", HIDDEN);
     LOAD2(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    if (!normalize_grouped_qkv_bf16(dit, block->qkv, error, error_size))
+        return 0;
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
     LOAD2(out, "attn.out_proj.weight", HIDDEN, INNER);
@@ -624,7 +661,13 @@ static int prepare_stream_source(h3_dit *dit,
                 error, error_size))
             return 0;
         source->int8 = 1;
+        source->qkv_grouped = field == STREAM_QKV && dit->conventional_qkv;
     } else if (tensor->dtype == H3_DTYPE_BF16) {
+        if (field == STREAM_QKV && dit->conventional_qkv) {
+            fail(error, error_size,
+                 "streaming a conventional BF16 QKV is unsupported: %s", name);
+            return 0;
+        }
         source->path = header->path;
         source->file_offset = tensor->file_offset;
     } else {
@@ -699,14 +742,28 @@ typedef struct {
 typedef struct {
     h3_gpu_tensor *target;
     size_t columns;
+    int qkv_grouped;
 } h3_dit_int8_stream_sink;
 
 static int stream_int8_emit(void *opaque, size_t row_begin, size_t row_count,
                             const uint16_t *values) {
     h3_dit_int8_stream_sink *sink = opaque;
-    return h3_gpu_tensor_write_bf16_range(
-        sink->target, row_begin * sink->columns, values,
-        row_count * sink->columns);
+    if (!sink->qkv_grouped)
+        return h3_gpu_tensor_write_bf16_range(
+            sink->target, row_begin * sink->columns, values,
+            row_count * sink->columns);
+    /* Conventional [q|k|v] rows land at their grouped positions. Slabs are
+     * multiples of HEAD_DIM, so rows move in contiguous HEAD_DIM runs. */
+    if (row_begin % HEAD_DIM || row_count % HEAD_DIM) return 0;
+    for (size_t chunk = 0; chunk < row_count; chunk += HEAD_DIM) {
+        size_t destination = grouped_qkv_row(row_begin + chunk);
+        if (!h3_gpu_tensor_write_bf16_range(
+                sink->target, destination * sink->columns,
+                values + chunk * sink->columns,
+                HEAD_DIM * sink->columns))
+            return 0;
+    }
+    return 1;
 }
 
 static int read_stream_layer(h3_dit_stream_job *job) {
@@ -726,7 +783,8 @@ static int read_stream_layer(h3_dit_stream_job *job) {
             break;
         }
         if (source->int8) {
-            h3_dit_int8_stream_sink sink = {target, source->columns};
+            h3_dit_int8_stream_sink sink = {target, source->columns,
+                                            source->qkv_grouped};
             if (!h3_weight_int8_stream_bf16(
                     source->path, source->file_offset, source->rows,
                     source->columns, source->scales, source->group_size,
@@ -1370,17 +1428,48 @@ static int prepare_ane_block(h3_dit *dit, h3_dit_block *block, unsigned index,
         snprintf(name, sizeof(name), "blocks.%u.%s", index,
                  plan[entry].suffix);
         const h3_st_tensor *stored = h3_weight_find(dit->weights, name, NULL);
-        *plan[entry].slot = stored && stored->dtype == H3_DTYPE_I8 ?
-            h3_ane_projection_create_int8(
-                dit->gpu, label, dit->weights, name, plan[entry].input_dim,
-                plan[entry].output_dim, dit->sequence,
+        if (stored && stored->dtype == H3_DTYPE_I8) {
+            int8_t *quantized = NULL;
+            float *scales = NULL;
+            int group_size = 0;
+            if (!h3_weight_load_int8_raw(
+                    dit->weights, name, plan[entry].output_dim,
+                    plan[entry].input_dim, &quantized, &scales, &group_size,
+                    error, error_size)) return 0;
+            if (entry == 0 && dit->conventional_qkv) {
+                size_t rows = (size_t)plan[entry].output_dim;
+                size_t columns = plan[entry].input_dim;
+                int8_t *grouped = malloc(rows * columns);
+                float *grouped_scales = malloc(rows * sizeof(*grouped_scales));
+                if (!grouped || !grouped_scales) {
+                    fail(error, error_size, "out of memory regrouping QKV");
+                    free(grouped); free(grouped_scales);
+                    free(quantized); free(scales);
+                    return 0;
+                }
+                for (size_t row = 0; row < rows; row++) {
+                    size_t destination = grouped_qkv_row(row);
+                    memcpy(grouped + destination * columns,
+                           quantized + row * columns, columns);
+                    grouped_scales[destination] = scales[row];
+                }
+                free(quantized); free(scales);
+                quantized = grouped; scales = grouped_scales;
+            }
+            *plan[entry].slot = h3_ane_projection_create_int8_raw(
+                dit->gpu, label, quantized, scales, group_size,
+                plan[entry].input_dim, plan[entry].output_dim, dit->sequence,
                 h3_ane_linear_default_chunk(plan[entry].input_dim), error,
-                error_size) :
-            h3_ane_projection_create(
+                error_size);
+            free(quantized);
+            free(scales);
+        } else {
+            *plan[entry].slot = h3_ane_projection_create(
                 dit->gpu, label, plan[entry].weight, plan[entry].input_dim,
                 plan[entry].output_dim, dit->sequence,
                 h3_ane_linear_default_chunk(plan[entry].input_dim), error,
                 error_size);
+        }
         if (!*plan[entry].slot) return 0;
     }
     uint64_t released_bytes = 0;
@@ -1819,6 +1908,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    dit->conventional_qkv =
+        h3_weight_find(dit->weights, "adaln_t_table", NULL) != NULL;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -2388,6 +2479,20 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
     if (evaluate_core) {
+        const char *predump_dir = getenv("H3_DEBUG_HIDDEN_DIR");
+        if (predump_dir) {
+            OP(h3_gpu_submit(dit->gpu), "submit for pre-core dump");
+            size_t elements = (size_t)dit->sequence * HIDDEN;
+            uint16_t *snapshot = malloc(elements * sizeof(*snapshot));
+            char path[512];
+            snprintf(path, sizeof(path), "%s/hidden_pre.bf16", predump_dir);
+            FILE *out = snapshot ? fopen(path, "wb") : NULL;
+            if (out && h3_gpu_tensor_read_bf16(dit->hidden, snapshot, elements))
+                fwrite(snapshot, sizeof(*snapshot), elements, out);
+            if (out) fclose(out);
+            free(snapshot);
+            OP(h3_gpu_begin(dit->gpu), "resume after pre-core dump");
+        }
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
         if (dit->ssd_streaming) command_blocks = 0;
@@ -2511,6 +2616,20 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 dit->stream_ready_layer = stream_job.layer;
                 dit->stream_ready_slot = stream_job.slot;
+                const char *dump_dir = getenv("H3_DEBUG_HIDDEN_DIR");
+                if (dump_dir) {
+                    size_t elements = (size_t)dit->sequence * HIDDEN;
+                    uint16_t *snapshot = malloc(elements * sizeof(*snapshot));
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/hidden_block%u.bf16",
+                             dump_dir, block);
+                    FILE *out = snapshot ? fopen(path, "wb") : NULL;
+                    if (out && h3_gpu_tensor_read_bf16(dit->hidden, snapshot,
+                                                       elements))
+                        fwrite(snapshot, sizeof(*snapshot), elements, out);
+                    if (out) fclose(out);
+                    free(snapshot);
+                }
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
             }
@@ -3177,6 +3296,17 @@ int h3_dit_denoise_euler_preview(
                      dit->sigmas.audio[step], dit->sigmas.audio[step + 1]);
             if (!ok) fail(error, error_size,
                           "Euler solver rejected step %d", step);
+            if (ok && getenv("H3_DEBUG_LATENT")) {
+                double vel = 0, lat = 0;
+                for (size_t i = 0; i < video_count; i++) {
+                    vel += (double)video_velocity[i] * video_velocity[i];
+                    lat += (double)video_latent[i] * video_latent[i];
+                }
+                fprintf(stderr, "h3: step %d sigma %.4f->%.4f "
+                        "v_vel rms=%.4f v_lat rms=%.4f\n", step,
+                        dit->sigmas.video[step], dit->sigmas.video[step + 1],
+                        sqrt(vel / video_count), sqrt(lat / video_count));
+            }
         }
         if (ok && preview &&
             preview(step + 1, dit->sigmas.steps, video_latent, video_count,
